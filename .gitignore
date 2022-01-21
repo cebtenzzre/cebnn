@@ -1,0 +1,10 @@
+/.*/
+__pycache__/
+.gdb_history
+/stderr.log
+/data/
+/eval/
+/nets/
+/cmpfigs/
+/metrics/
+/bestmaj/

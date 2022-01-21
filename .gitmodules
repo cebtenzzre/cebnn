@@ -1,0 +1,3 @@
+[submodule "adamwr"]
+	path = adamwr
+	url = https://github.com/cebtenzzre/adamwr.git
