@@ -154,11 +154,31 @@ json.dump(pkl, sys.stdout, default=default)
 EOF
 }
 
-lint() {
+LINT_FILES=( algorithm.py best_majvote_eval.py best_majvote.py cpickledir_checksame.py datamunge.py dataset.py dedup_listing.py eval_print_majvote.py eval_print.py eval_print_sorted.py eval.py eval_stream.py cebnn_common.py cebnn_main.py losses.py merge_results.py scale.py subtract_listings.py tag_all.py util.py )
+
+_lint() {
   # Make sure we can import the main file
-  python -c 'import cebnn_main' || return 1
+  if (( ${@[(Ie)cebnn_main.py]} )); then
+    python -c 'import cebnn_main' || return 1
+  fi
 
   # Modules with stubs have to be checked separately
   mypy --python-executable="$(which python)" util.py || return 1
-  mypy --python-executable="$(which python)"
+  mypy --python-executable="$(which python)" || return 1
+
+  (( $# )) || return
+  pytype -V 3.8 -j auto --keep-going --strict_namedtuple_checks --precise-return "$@"
+  flake8 --max-line-length=120 --select=F,U100,E501,W291 --ignore=F811 "$@"
 }
+
+lint() {
+  setopt local_options
+  set -o pipefail
+
+  local touched_files
+  touched_files=( ${(@0)"$(git status -z --porcelain=v1 "${LINT_FILES[@]}" | sed -z 's/^.. //')"} ) || return 1
+
+  _lint "${touched_files[@]}"
+}
+
+lint_full() { _lint "${LINT_FILES[@]}"; }
