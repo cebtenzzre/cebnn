@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     StrPath = Union[str, 'os.PathLike[str]']
     AnyEstimator = TypeVar('AnyEstimator', bound=BaseEstimator)
     AnyResampleArgs = TypeVar('AnyResampleArgs', bound='ResampleArgs')
-    AnyRLS = TypeVar('AnyRLS', bound='ResettableLabeledSubset')
+    AnyRLS = TypeVar('AnyRLS', bound='ResampledLabeledSubset')
     AnyDataset = Union[Dataset[Any]]
 
 T = TypeVar('T')
@@ -690,7 +690,7 @@ def save_random_state() -> Dict[str, Any]:
 
 class TrainerCallback(Callback):
     def __init__(self, scheduler: _LRScheduler, warmup_scheduler: Optional[UntunedLinearWarmup], pbar: ProgressBar,
-                 dataset: ResettableLabeledSubset) -> None:
+                 dataset: ResampledLabeledSubset) -> None:
         self.scheduler = scheduler
         self.warmup_scheduler = warmup_scheduler
         self.pbar = pbar
@@ -758,7 +758,6 @@ class TrainerCallback(Callback):
         print('==> Best validation loss: {:4f}'.format(self.best_loss))
 
     def _save_state_dict(self, net: NeuralNetClassifier) -> None:
-        cv_iter = net.train_split.iter
         self.best_state = io.BytesIO()
         save_dict = get_save_state_dict(
             cfg=cfg,
@@ -770,59 +769,42 @@ class TrainerCallback(Callback):
             random_state=save_random_state(),
             net=net,
             bal_train_dataset=self.dataset,
-            cv_stash=None if cv_iter is None else cv_iter.cur,
+            cv_stash=net.train_split.split,
         )
         torch.save(save_dict, self.best_state, pickle_module=mypickle)
         self.best_state.seek(0)
 
 
-class ChainForever(Iterator[T]):
-    def __init__(self, get: Callable[[], List[T]], cur: Optional[List[T]] = None) -> None:
-        self.cur = cur
-        self.get = get
-
-    def __next__(self) -> T:
-        if not self.cur:
-            self.cur = self.get()
-        val = self.cur[0]
-        del self.cur[0]
-        return val
-
-
 class CVSplit:
-    def __init__(self, cv: BaseCrossValidator, batch_size: int, offset: int = 0,
-                 chain_stash: Optional[List[Tuple[Sequence[int], ...]]] = None) -> None:
+    def __init__(
+        self, cv: BaseCrossValidator, batch_size: int, split_idx: int,
+        split: Optional[Tuple[Sequence[int], Sequence[int]]] = None,
+    ) -> None:
         self.cv = cv
         self.batch_size = batch_size
-        self.offset = offset
-        self.chain_stash = chain_stash
-        self.iter: Optional[ChainForever[Tuple[Sequence[int], ...]]] = None
+        self.split_idx = split_idx
+        self.split = split
 
     def __call__(
-        self, dataset: ResettableLabeledSubset, y: object  # noqa: U100
-    ) -> Iterator[Tuple[LabeledSubset, ...]]:
-        if self.iter is None:
-            self.iter = ChainForever(lambda: self._get_splits(dataset), cur=self.chain_stash)
-            self.chain_stash = None
-        if self.offset:
-            next(islice(self.iter, self.offset, self.offset), None)
-            self.offset = 0
-        for split in self.iter:
-            yield tuple(LabeledSubset(dataset, sub_indices) for sub_indices in split)
+        self, dataset: ResampledLabeledSubset, y: object  # noqa: U100
+    ) -> Tuple[LabeledSubset, LabeledSubset]:
+        if self.split is None:
+            self.split = self._get_split(dataset)
+        ds_train, ds_valid = (LabeledSubset(dataset, sub_indices) for sub_indices in self.split)
+        return (
+            TransformedDataset(ds_train, data_transforms['train']),
+            TransformedDataset(ds_valid, data_transforms['valid']),
+        )
 
-    def _get_splits(self, dataset: ResettableLabeledSubset) -> List[Tuple[Sequence[int], ...]]:
-        dataset.reset()
-        def fix(label: str, half: Sequence[int]) -> Sequence[int]:
-            # Prevent single-item batch at end of training phase - breaks batchnorm
-            if label == 'train' and len(half) % self.batch_size == 1:
-                half = half[:-1]
-            return half
+    def _get_split(self, dataset: ResampledLabeledSubset) -> Tuple[Sequence[int], Sequence[int]]:
         splits = self.cv.split(np.arange(get_len(dataset)), to_numpy(dataset.targets), dataset.groups)
-        return [
-            tuple(
-                starmap(fix, zip_strict(('train', 'valid'), split)),
-            ) for split in splits
-        ]
+        ds_train, ds_valid = splits[self.split_idx]
+
+        # prevent single-item batch at end of training phase - breaks batchnorm
+        if len(ds_train) % self.batch_size == 1:
+            ds_train = ds_train[:-1]
+
+        return ds_train, ds_valid
 
 
 class DataLoaderWithNewSampler(DataLoader):
@@ -887,33 +869,32 @@ class MyNeuralNetClassifier(NeuralNetClassifier):
             param.grad = None
         return step_accumulator.get_step()
 
-    # Modified fit_loop that actually CROSS-validates
+    # Passes the epoch to the callbacks and run_single_epoch
     def fit_loop(self, X: AnyDataset, y: Optional[Array] = None, epochs: Optional[int] = None, **fit_params: Any) \
             -> NeuralNetClassifier:
         self.check_data(X, y)
-        epochs = self.max_epochs if epochs is None else epochs
-        dataset = self.get_dataset(X, y)
+        epochs = epochs if epochs is not None else self.max_epochs
+
+        dataset_train, dataset_valid = self.get_split_datasets(X, y, **fit_params)
+        on_epoch_kwargs = {
+            'dataset_train': dataset_train,
+            'dataset_valid': dataset_valid,
+        }
 
         for epoch in range(self.initial_epoch, self.initial_epoch + epochs):
-            if self.train_split is None:
-                datasets = dataset, None
-            else:
-                datasets = next(self.train_split(dataset, y, **fit_params))
-            dataset_train, dataset_valid = (TransformedDataset(ds, data_transforms[dt])
-                                            for ds, dt in zip_strict(datasets, ('train', 'test')))
-            on_epoch_kwargs = {'dataset_train': dataset_train, 'dataset_valid': dataset_valid, 'epoch': epoch}
+            on_epoch_kwargs['epoch'] = epoch
+            fit_params['epoch'] = epoch
+
             self.notify('on_epoch_begin', **on_epoch_kwargs)
 
             self.run_single_epoch(dataset_train, training=True, prefix='train',
-                                  step_fn=self.train_step, epoch=epoch, **fit_params)
+                                  step_fn=self.train_step, **fit_params)
 
             if dataset_valid is not None:
                 self.run_single_epoch(dataset_valid, training=False, prefix='valid',
-                                      step_fn=self.validation_step, epoch=epoch, **fit_params)
+                                      step_fn=self.validation_step, **fit_params)
 
             self.notify('on_epoch_end', **on_epoch_kwargs)
-        self.initial_epoch = None  # Discourage using fit() multiple times (for now?)
-
         return self
 
     def get_loss(self, y_pred: Tensor, y_true: Tensor, *args: object, **kwargs: object) -> NoReturn:  # noqa: U100
@@ -981,7 +962,7 @@ class ResampleArgs:
         return cls(alg, kwargs)
 
 
-class ResettableLabeledSubset(LabeledDataset):
+class ResampledLabeledSubset(LabeledDataset):
     def __init__(self, dataset: LabeledDataset, indices: Optional[Sequence[int]],  # pytype: disable=module-attr
                  rand: np.random.RandomState) -> None:
         self.dataset = dataset
@@ -990,10 +971,12 @@ class ResettableLabeledSubset(LabeledDataset):
 
     @classmethod
     def new(cls: Type[AnyRLS], dataset: LabeledDataset) -> AnyRLS:
-        return cls(
+        inst = cls(
             dataset, None,
             np.random.RandomState(np.random.randint(0, 2**32)),  # pytype: disable=module-attr
         )
+        inst._init()
+        return inst
 
     @classmethod
     def load(cls: Type[AnyRLS], dataset: LabeledDataset,  # pytype: disable=module-attr
@@ -1027,7 +1010,7 @@ class ResettableLabeledSubset(LabeledDataset):
             return self.dataset.groups
         return self.dataset.groups[list(self.indices)]
 
-    def reset(self) -> None:
+    def _init(self) -> None:
         if cfg.resample.algorithm is not None:
             self.indices = tuple(ImbalancedDatasetSampler(
                 self.dataset.labelset, ds_labels=cfg.class_names,
@@ -1051,8 +1034,7 @@ class Config:
         self.cpload:              bool            = False
         self.criterion:           str             = ''
         self.cvfolds:             Optional[int]   = None
-        self.cvfolds_override:    bool            = False
-        self.cv_offset:           Any             = None
+        self.cvsplit:             Optional[int]   = None
         self.epochs:              int             = DEFAULT_EPOCHS
         self.initial_epoch:       Any             = None
         self.inner_dropout:       Union[float, Tuple[float, ...]] = 0.
@@ -1081,11 +1063,12 @@ class Config:
         self.weight_decay:        Optional[float] = None
 
 
-def get_save_state_dict(cfg: 'Config', options: 'MainArgParser', model_state_dict: Dict[str, Any],
-                        optimizer_state_dict: Dict[str, Any], scheduler: _LRScheduler,
-                        warmup_scheduler: Optional[UntunedLinearWarmup], random_state: Dict[str, Any],
-                        net: MyNeuralNetClassifier, bal_train_dataset: 'ResettableLabeledSubset',
-                        cv_stash: Optional[List[Tuple[Sequence[int], ...]]]) -> Dict[str, Any]:
+def get_save_state_dict(
+    cfg: 'Config', options: 'MainArgParser', model_state_dict: Dict[str, Any], optimizer_state_dict: Dict[str, Any],
+    scheduler: _LRScheduler, warmup_scheduler: Optional[UntunedLinearWarmup], random_state: Dict[str, Any],
+    net: MyNeuralNetClassifier, bal_train_dataset: 'ResampledLabeledSubset',
+    cv_stash: Optional[Tuple[Sequence[int], Sequence[int]]],
+) -> Dict[str, Any]:
     model = net.module_
     old_training = model.training
     model.train()
@@ -1126,7 +1109,7 @@ def get_save_state_dict(cfg: 'Config', options: 'MainArgParser', model_state_dic
         'scheduler': scheduler,
         'warmup_state': None if warmup_scheduler is None else warmup_scheduler.state_dict(),
         'random_state': random_state,
-        'cv_offset': cfg.cv_offset,
+        'cvsplit': cfg.cvsplit,
         'history': net.history_,
         'virtual_params': net.virtual_params_,
     }
@@ -1232,7 +1215,7 @@ class MainArgParser(Tap):
     inner_dropout: Optional[Tuple[float, ...]] = None  # Apply inner dropout with probability P
     classifier_dropout: Optional[float] = None  # Apply classifier dropout with probability P
     cvfolds: Optional[int] = None  # Use K-fold cross validation
-    cv_offset: Optional[int] = None  # Offset CV split by N epochs
+    cvsplit: Optional[int] = None  # Which fold of the cross validator to use
     epochs: Optional[int] = None  # Train for N epochs
     scheduler: Optional[Literal['cyclic', 'cosine', 'linear', 'NONE']] = None  # Which type of LR scheduler to use
 
@@ -1292,7 +1275,7 @@ class MainArgParser(Tap):
         self.add_argument('--inner-dropout', type=tuple_arg(ratio_float, sep=';'), metavar='P')
         self.add_argument('--classifier-dropout', type=ratio_float, metavar='P')
         self.add_argument('--cvfolds', type=positive_int, metavar='K')
-        self.add_argument('--cv-offset', metavar='N')
+        self.add_argument('--cvsplit', type=nonnegative_int, metavar='N')
         self.add_argument('--epochs', type=nonnegative_int, metavar='N')
         self.add_argument('--lr', type=positive_float)
         self.add_argument('--gamma', type=positive_float, metavar='γ')
@@ -1617,36 +1600,24 @@ def main() -> None:
     else:
         cfg.weight_decay = options.wd
 
-    cfg.cvfolds_override = False
+    if options.cvfolds is not None and (options.load or not cfg.training):
+        parser.error('--cvfolds is only valid if training a new model')
+    if (options.cvsplit is None) != (options.load or not cfg.training):
+        parser.error('--cvsplit is required iff training a new model')
+
     if checkpoint is not None and options.task == 'train':
         cfg.cvfolds = checkpoint['cvfolds']
-        if options.cvfolds is not None:
-            if options.cvfolds == cfg.cvfolds:
-                print('\x1b[93;1mWarning: --cvfolds unnecessarily specified, rebuilding anyway\x1b[0m', file=sys.stderr)
-            else:
-                print('==> Overriding cvfolds: {} -> {}'.format(cfg.cvfolds, options.cvfolds))
-                cfg.cvfolds = options.cvfolds
-            cfg.cvfolds_override = True
+        cfg.cvsplit = checkpoint['cvsplit']
 
         if cfg.cont_sch and options.gamma_override is not None \
                 and not issubclass(checkpoint['scheduler_type'], CyclicLRWithRestarts):
             parser.error('--gamma-override requires a cyclic scheduler')
     else:
         cfg.cvfolds = DEFAULT_CVFOLDS if options.cvfolds is None else options.cvfolds
+        cfg.cvsplit = options.cvsplit
 
     if options.task == 'train':
         cfg.initial_epoch = 0 if checkpoint is None else checkpoint['epoch'] + 1
-
-        cfg.cv_offset = 0
-        if checkpoint is not None:
-            cfg.cv_offset += checkpoint.get('cv_offset', 0)
-        assert cfg.initial_epoch + cfg.cv_offset >= 0
-        if options.cv_offset is not None:
-            if cfg.initial_epoch + cfg.cv_offset + options.cv_offset < 0:
-                parser.error('--cv-offset too low: Given {}, minimum is {}'.format(
-                    options.cv_offset, cfg.initial_epoch + cfg.cv_offset,
-                ))
-            cfg.cv_offset += options.cv_offset
 
     if checkpoint is not None:
         cfg.tta_mode = checkpoint.get('tta_mode', 'none')
@@ -1733,12 +1704,11 @@ def main() -> None:
     if options.task != 'print_numels':
         if cfg.need_train_data:
             if checkpoint is None:
-                bal_train_dataset = ResettableLabeledSubset.new(image_datasets['train'])
-                if options.task != 'train':
-                    bal_train_dataset.reset()  # Initialize the dataset
+                bal_train_dataset = ResampledLabeledSubset.new(image_datasets['train'])
             else:
-                bal_train_dataset = ResettableLabeledSubset.load(
-                    image_datasets['train'], checkpoint['dataset_indices'], checkpoint['dataset_rand'])
+                bal_train_dataset = ResampledLabeledSubset.load(
+                    image_datasets['train'], checkpoint['dataset_indices'], checkpoint['dataset_rand'],
+                )
         dataloaders['opt'] = make_dataloader(image_datasets['opt'], data_transforms['test'])
         dataloaders['test'] = make_dataloader(image_datasets['test'], data_transforms['test'])
 
@@ -1966,21 +1936,15 @@ def main() -> None:
                 group['initial_lr'] = group['lr'] = options.lr
 
         assert scheduler is not None
-        assert cfg.cvfolds is not None
-        if checkpoint is not None and not cfg.cvfolds_override:
-            cv_split: Optional[CVSplit] = CVSplit(
-                MLStratifiedGroupKFold(
-                    n_labels=len(cfg.class_names), n_splits=cfg.cvfolds, random_state=bal_train_dataset.rand),
-                cfg.batch_size,
-                offset=cfg.cv_offset,
-                chain_stash=checkpoint['cv_stash'],
-            )
-        else:
-            cv_split = CVSplit(
-                MLStratifiedGroupKFold(
-                    n_labels=len(cfg.class_names), n_splits=cfg.cvfolds, random_state=bal_train_dataset.rand),
-                cfg.batch_size,
-            )
+        assert cfg.cvfolds is not None and cfg.cvsplit is not None
+        cv_split = CVSplit(
+            MLStratifiedGroupKFold(
+                n_labels=len(cfg.class_names), n_splits=cfg.cvfolds, random_state=bal_train_dataset.rand,
+            ),
+            cfg.batch_size,
+            split_idx=cfg.cvsplit,
+            split=checkpoint['cv_stash'] if checkpoint else None,
+        )
 
         pbar = ProgressBar()
         trainer_cb: Optional[TrainerCallback] = \
@@ -2083,10 +2047,6 @@ def main() -> None:
                 save_dict = best_state_dict
                 assert save_dict is not None  # Assume training began
             else:
-                if cv_split is None or cv_split.iter is None:
-                    cv_stash = None
-                else:
-                    cv_stash = cv_split.iter.cur
                 save_dict = get_save_state_dict(
                     cfg=cfg,
                     options=options,
@@ -2097,7 +2057,7 @@ def main() -> None:
                     random_state=random_state,
                     net=net,
                     bal_train_dataset=bal_train_dataset,
-                    cv_stash=cv_stash,
+                    cv_stash=cv_split.split if cv_split else None,
                 )
             save_dict.update(get_save_stats_dict(
                 model=model,
