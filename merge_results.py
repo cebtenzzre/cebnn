@@ -39,7 +39,7 @@ if __name__ == '__main__':
         lines = (l.rstrip('\n') for l in tqdm(kf, total=line_count, leave=False))
         sumdata = tuple((k, getval(k, diffdata, adata)) for k in lines)
 
-    with open(destpickle, 'wb') as pf:
-        pickle.dump(sumdata, pf)
+    with open(destpickle, 'wb') as sf:
+        pickle.dump(sumdata, sf)
 
     print('{} + {} = {} -> {}'.format(len(adata), len(diffdata), len(adata) + len(diffdata), len(sumdata)))
