@@ -13,7 +13,6 @@ scipy>=1.7.3
 skorch==0.9.0
 timm==0.5.4
 torch==1.6.0
-torch_lr_finder==0.2.1
 torchvision==0.7.0
 tqdm>=4.62.3
 https://github.com/juntang-zhuang/Adabelief-Optimizer/archive/update_0.3.0.zip#subdirectory=pypi_packages/adabelief_pytorch0.3.0

@@ -1205,7 +1205,7 @@ ratio_float       = check_cond(float, lambda v: 0 <= v <= 1, 'between zero and o
 
 
 class MainArgParser(Tap):
-    task: Literal['preview_input', 'print_numels', 'find_lr', 'find_aug', 'train', 'visualize', 'metrics', 'eval_test',
+    task: Literal['preview_input', 'print_numels', 'find_aug', 'train', 'visualize', 'metrics', 'eval_test',
                   'get_correct', 'roc']
     """What to do with the neural network"""
 
@@ -1260,7 +1260,7 @@ class MainArgParser(Tap):
     fig_dir: Optional[str] = None  # Where to store plotted figures
     eval_dir: Optional[str] = None  # Where to store eval pickles
     correct_dir: Optional[str] = None  # Where to store correctness pickles
-    quick_findlr: bool = False  # (find_lr/find_aug) Validate on only 500 samples, and (find_aug) train on 250
+    quick_find: bool = False  # (find_aug) Validate on only 500 samples, and train on 250
 
     tta: Optional[Literal['none', 'mean', 'local_certainty', 'global_certainty']] = None
     """Test time augmentation mode"""
@@ -1335,7 +1335,7 @@ def main() -> None:
     assert options.sublayers is None or len(options.sublayers) == req_models
     assert options.inner_dropout is None or len(options.inner_dropout) == req_models
 
-    train_tasks = ('find_lr', 'find_aug', 'train')
+    train_tasks = ('find_aug', 'train')
     cfg.training = options.task in train_tasks
     cfg.need_train_data = options.task in train_tasks + ('preview_input',)
     cfg.cpload = options.load is not None and req_models == 1
@@ -1373,9 +1373,8 @@ def main() -> None:
         parser.error('Ensemble building is only valid for tasks: {}'.format(', '.join(valid_ensemble_tasks)))
     assert (options.load is not None) == cfg.cpload or cfg.building_ensemble
 
-    quick_find_tasks = ('find_lr', 'find_aug')
-    if options.quick_findlr and options.task not in quick_find_tasks:
-        parser.error('--quick-findlr is only valid for tasks: {}'.format(quick_find_tasks))
+    if options.quick_find and options.task != 'find_aug':
+        parser.error('--quick-find is only valid for --task find_aug')
     if options.forget_state and not cfg.cpload:
         parser.error('--forget-state is only valid if loading a checkpoint')
     if options.forget_state is None:
@@ -1715,9 +1714,8 @@ def main() -> None:
             os.path.join(options.data_dir, 'images'),
         ) for x in ('train', 'opt', 'test')}
 
-    if options.quick_findlr:
-        if options.task == 'find_aug':
-            image_datasets['train'] = LabeledSubset(image_datasets['train'], range(250))
+    if options.quick_find:
+        image_datasets['train'] = LabeledSubset(image_datasets['train'], range(250))
         image_datasets['opt'] = LabeledSubset(image_datasets['opt'], range(500))
 
     if options.task == 'preview_input':
@@ -1825,7 +1823,7 @@ def main() -> None:
                 printn(loader)
         sys.exit(0)
 
-    if options.task not in ('find_lr', 'find_aug', 'train'):
+    if options.task not in ('find_aug', 'train'):
         model_loader = UNTYPED_NONE
 
     device = torch.device('cuda:0' if options.use_cuda and torch.cuda.is_available() else 'cpu')
@@ -1858,23 +1856,6 @@ def main() -> None:
 
     if options.task != 'train':
         criterion = criterion_type(norm_params, model, annealing_step=cfg.annealing_step)
-
-    if options.task == 'find_lr':
-        from torch_lr_finder import LRFinder
-        model_loader.postload()
-        del model_loader
-        dataloaders['train'] = make_dataloader(bal_train_dataset, data_transforms['train'])
-        optimizer = cfg.optimizer_type(opt_params, lr=1e-4)
-        lr_finder = LRFinder(model, optimizer, partial(criterion, epoch=0), device=device)
-        lr_finder.range_test(dataloaders['train'], val_loader=dataloaders['opt'],
-                             end_lr=1e2, num_iter=40, step_mode='exp', accumulation_steps=10, diverge_th=2)
-        lrs = lr_finder.history['lr']
-        losses = lr_finder.history['loss']
-        best_lr = min(zip_strict(lrs, losses), key=lambda x: x[1])
-        print('==> Best LR: lr={:.8f}, loss={:.4f}'.format(best_lr[0], best_lr[1]))
-        lr_finder.plot(skip_start=0, skip_end=0)
-        lr_finder.reset()
-        sys.exit(0)
 
     if options.task == 'find_aug':
         model_loader.postload()
