@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import random
 import sys
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 from sklearn.preprocessing import MultiLabelBinarizer
@@ -50,8 +51,13 @@ def set_fweights(it: Iterable['os.DirEntry[str]'], weights: Dict[str, float], we
             weights[wf.name] = weight
 
 
-def write_file(name: str, samples: Iterable[str], labels: Dict[str, Set[str]]) -> None:
-    outfile = '{}_tagged.csv'.format(name)
+def write_file(fold: int, name: str, samples: Iterable[str], labels: Dict[str, Set[str]]) -> None:
+    folder = 'fold{}'.format(fold)
+    try:
+        os.mkdir(folder)
+    except FileExistsError:
+        pass
+    outfile = os.path.join(folder, '{}_tagged.csv'.format(name))
     with open(outfile, 'w') as outf:
         writer = csv.writer(outf)
         writer.writerow(['image_name', 'tags'])
@@ -87,13 +93,22 @@ def shuffle_dataset(X: Sequence[str], y: Array, groups: Array) -> Tuple[List[str
     return [X[i] for i in indices], y[indices], groups[indices]
 
 
-def train_test_split(X: Sequence[str], y: Array, groups: Array, test_size: float, n_labels: int) \
-        -> Tuple[List[str], List[str], Array, Array, Array, Array]:
-    stratifier = MLStratifiedGroupKFold(n_labels=n_labels, n_splits=2, fold_ratios=[test_size, 1 - test_size])
-    train_indices, test_indices = next(stratifier.split(X, y, groups))
-    X_train = [X[i] for i in train_indices]
-    X_test = [X[i] for i in test_indices]
-    return X_train, X_test, y[train_indices], y[test_indices], groups[train_indices], groups[test_indices]
+def train_test_split(
+    X: Sequence[str], y: Array, groups: Array, n_labels: int,
+    test_size: Optional[float] = None, n_splits: Optional[int] = None,
+) -> Iterator[Tuple[List[str], List[str], Array, Array, Array, Array]]:
+    if (test_size is None) == (n_splits is None):
+        raise ValueError('expected one of test_size or n_splits')
+    stratifier = MLStratifiedGroupKFold(
+        n_labels=n_labels,
+        n_splits=2 if n_splits is None else n_splits,
+        fold_ratios=None if test_size is None else [test_size, 1 - test_size],
+    )
+    splits = stratifier.split(X, y, groups)
+    for train_indices, test_indices in splits:
+        X_train = [X[i] for i in train_indices]
+        X_test = [X[i] for i in test_indices]
+        yield X_train, X_test, y[train_indices], y[test_indices], groups[train_indices], groups[test_indices]
 
 
 def apply_weights(X: Sequence[str], y: Array, weights: Dict[str, float]) \
@@ -126,8 +141,9 @@ def apply_weights(X: Sequence[str], y: Array, weights: Dict[str, float]) \
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        raise ValueError('Expected no arguments, got {}'.format(len(sys.argv) - 1))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--splits', type=int, metavar='N', default=5)
+    opts = parser.parse_args()
 
     seed_all(24)
 
@@ -167,21 +183,23 @@ def main() -> None:
         trainable_X, trainable_y, trainable_groups = filter_dataset(X, y, groups, lambda Xi, _: Xi not in exclude)
 
     datafiles: Dict[str, List[str]] = {}
-    train_X, not_train_X, train_y, not_train_y, train_groups, not_train_groups \
-        = split(trainable_X, trainable_y, trainable_groups, .4)
-    datafiles['train'] = train_X
+    for n, fold in enumerate(split(trainable_X, trainable_y, trainable_groups, n_splits=opts.splits)):
+        train_X, not_train_X, train_y, not_train_y, train_groups, not_train_groups = fold
 
-    not_train_X.extend(test_only_X)
-    not_train_y      = np.concatenate((not_train_y,      test_only_y))  # type: ignore[no-untyped-call]
-    not_train_groups = np.concatenate((not_train_groups, test_only_groups))  # type: ignore[no-untyped-call]
-    not_train_X, not_train_y, not_train_groups = shuffle_dataset(not_train_X, not_train_y, not_train_groups)
+        datafiles.clear()
+        datafiles['train'] = train_X
 
-    opt_X, test_X, opt_y, test_y, _, _ = split(not_train_X, not_train_y, not_train_groups, .5)
-    datafiles['opt'] = opt_X
-    datafiles['test'] = test_X
+        not_train_X.extend(test_only_X)
+        not_train_y      = np.concatenate((not_train_y,      test_only_y))  # type: ignore[no-untyped-call]
+        not_train_groups = np.concatenate((not_train_groups, test_only_groups))  # type: ignore[no-untyped-call]
+        not_train_X, not_train_y, not_train_groups = shuffle_dataset(not_train_X, not_train_y, not_train_groups)
 
-    for name in ('train', 'opt', 'test'):
-        write_file(name, datafiles[name], labels)
+        opt_X, test_X, opt_y, test_y, _, _ = next(split(not_train_X, not_train_y, not_train_groups, test_size=.5))
+        datafiles['opt'] = opt_X
+        datafiles['test'] = test_X
+
+        for name in ('train', 'opt', 'test'):
+            write_file(n, name, datafiles[name], labels)
 
 
 if __name__ == '__main__':
