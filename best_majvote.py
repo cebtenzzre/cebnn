@@ -26,7 +26,7 @@ from algorithm import mcc_like_geo_youden as mcc, multilabel_confusion_matrix
 from util import zip_strict
 
 if TYPE_CHECKING:
-    from typing import Any, Collection, Dict, Iterable, Iterator, List, Optional, Tuple, Type
+    from typing import Any, Collection, Dict, Iterable, Iterator, List, Optional, Tuple
 
 T = TypeVar('T')
 CTypeable = Union[
@@ -39,8 +39,6 @@ SCT = TypeVar('SCT', bound=CTypeable, covariant=True)
 DTypeLike = Union[np.dtype[SCT], type[SCT]]
 IntArray = NDArray[np.int64]
 FloatArray = NDArray[np.float32]
-SharedIntArray = SharedArray[np.int64]
-SharedFloatArray = SharedArray[np.float32]
 
 
 MIN_LEN = 3
@@ -88,6 +86,10 @@ class SharedArray(Generic[SCT]):
     @classmethod
     def fromiter(cls, it: Iterable[Any], dtype: DTypeLike[SCT]) -> SharedArray[SCT]:
         return cls.fromnumpy(np.asarray(tuple(it), dtype=dtype))
+
+
+SharedIntArray = SharedArray[np.int64]
+SharedFloatArray = SharedArray[np.float32]
 
 
 def corr(a: NDArray[np.generic], b: NDArray[np.generic]) -> np.float64:

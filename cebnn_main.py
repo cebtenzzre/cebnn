@@ -21,11 +21,11 @@ import termios
 import time
 import warnings
 from collections import defaultdict
-from functools import partial, reduce
-from itertools import combinations, islice, starmap
+from functools import reduce
+from itertools import combinations
 from numbers import Real
 from timeit import default_timer as timer
-from typing import TYPE_CHECKING, Any, Container, Iterator, List, Literal, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Any, Container, List, Literal, Optional, Tuple, TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,7 +39,7 @@ from sklearn.metrics import matthews_corrcoef, roc_auc_score, roc_curve
 from skorch import NeuralNetClassifier
 from skorch.callbacks import Callback, ProgressBar
 from skorch.dataset import get_len, unpack_data
-from skorch.utils import TeeGenerator, to_numpy, to_tensor
+from skorch.utils import TeeGenerator, to_tensor
 from tap import Tap
 from torch import Tensor, autograd, nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
@@ -67,7 +67,6 @@ if TYPE_CHECKING:
 
     from PIL import Image
     from sklearn.base import BaseEstimator
-    from sklearn.model_selection._split import BaseCrossValidator
     from torch.optim.lr_scheduler import _LRScheduler
     from torch.utils.data.dataset import Dataset
 
