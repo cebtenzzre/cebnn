@@ -18,16 +18,8 @@ if TYPE_CHECKING:
     from util import Array
     Algorithm = Tuple[bool, Callable[..., List[int]]]
 
-    class Base(Sampler[int]):
-        pass
-else:
-    from util import FakeGenericABCMeta
 
-    class Base(Sampler, metaclass=FakeGenericABCMeta):  # pylint: disable=abstract-method
-        pass
-
-
-class ImbalancedDatasetSampler(Base):
+class ImbalancedDatasetSampler(Sampler[int]):
     """
     Samples elements randomly from a given list of indices for imbalanced dataset.
 

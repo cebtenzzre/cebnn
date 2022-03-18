@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-from abc import ABCMeta
 from typing import Any, Sized, Union
 
 import numpy as np
@@ -11,10 +10,6 @@ Array = Union['np.ndarray[Any, np.dtype[Any]]']
 class FakeGenericMeta(type):
     def __getitem__(cls, _item):
         return cls
-
-
-class FakeGenericABCMeta(FakeGenericMeta, ABCMeta):
-    pass
 
 
 _zip_strict_sentinel = object()

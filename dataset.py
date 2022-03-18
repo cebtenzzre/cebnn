@@ -5,42 +5,33 @@ from __future__ import annotations
 import os
 import re
 from abc import ABCMeta, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
 from sklearn.preprocessing import MultiLabelBinarizer
-
+from torch import Tensor
 from torch.utils.data.dataset import Dataset, Subset
 
+Element = tuple[Any, Tensor]
+
 if TYPE_CHECKING:
-    from typing import Any, Callable, Sequence, Set, Sized, Tuple, Union
+    from typing import Callable, Sequence, Set, Tuple, Union
     from pandas._typing import FilePathOrBuffer
-    from torch import Tensor
     from util import Array
-    StrPath = Union[str, 'os.PathLike[str]']
-    Element = Tuple[Any, Tensor]
+    StrPath = Union[str, os.PathLike[str]]
 
-    class Base(Sized, Dataset[Element], metaclass=ABCMeta):
-        pass
-
-    # dunno what's wrong with the stubs but pytype thinks __len__ is abstract
-    class BaseSub(Subset[Element]):
+    # See https://github.com/google/pytype/issues/1151
+    class LSBase(Subset[Element]):
         def __len__(self) -> int:
-            return 0
+            return 0  # NB: fake stub!
 else:
-    from util import FakeGenericABCMeta, FakeGenericMeta
-
-    class Base(Dataset, metaclass=FakeGenericABCMeta):  # pylint: disable=abstract-method
-        pass
-
-    class BaseSub(Subset, metaclass=FakeGenericMeta):
-        pass
+    LSBase = Subset[Element]
 
 
-class LabeledDataset(Base, metaclass=ABCMeta):
+class LabeledDataset(Dataset[Element], metaclass=ABCMeta):
     @property
     @abstractmethod
     def labelset(self) -> Sequence[Set[str]]:
@@ -55,6 +46,10 @@ class LabeledDataset(Base, metaclass=ABCMeta):
     @abstractmethod
     def groups(self) -> Array:
         raise NotImplementedError
+
+    @abstractmethod
+    def __len__(self) -> int:
+        raise TypeError
 
 
 class MultiLabelCSVDataset(LabeledDataset):
@@ -126,7 +121,7 @@ class TransformedDataset(LabeledDataset):
     def groups(self) -> Array: return self.dataset.groups
 
 
-class LabeledSubset(BaseSub, LabeledDataset):
+class LabeledSubset(LSBase, LabeledDataset):
     dataset: LabeledDataset
 
     @property

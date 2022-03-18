@@ -24,6 +24,7 @@ from collections import defaultdict
 from functools import reduce
 from itertools import combinations
 from numbers import Real
+from operator import itemgetter
 from timeit import default_timer as timer
 from typing import TYPE_CHECKING, Any, Container, List, Literal, Optional, Tuple, TypeVar
 
@@ -304,9 +305,11 @@ def geoy(true_labels: Array, predictions: Array, thresholds: Array,
 
     # Don't use the score if all predictions are true, all predictions are false, there are no true positives, or there
     # are no true negatives, for _any_ label. All of those are degenerate cases where the threshold is unusable.
-    def badlabel(truei: Array, predi: Array) -> np.bool_:
-        return (np.all(predi > 0.) or np.all(predi < .99)
-                or np.all(predi[truei > 0.] < .99) or np.all(predi[truei < .99] > 0.))
+    def badlabel(truei: Array, predi: Array) -> bool:
+        return bool(
+            np.all(predi > 0.) or np.all(predi < .99)
+            or np.all(predi[truei > 0.] < .99) or np.all(predi[truei < .99] > 0.)
+        )
 
     if i is None:
         for j in range(true_labels.shape[1]):
@@ -321,7 +324,7 @@ def geoy(true_labels: Array, predictions: Array, thresholds: Array,
     return score.tolist() if isinstance(score, np.ndarray) else score
 
 
-# Scipy tries to minimize the function so we must get its inverse
+# Scipy tries to minimize the function, so we must get its inverse
 def geoy_neg(true: Array, pred: Array, i: Optional[int] = None) -> Callable[[Array], float]:
     average = 'macro' if i is None and len(cfg.class_names) > 1 else 'binary'
     return lambda th: - geoy(true, pred, th, average=average, i=i)
@@ -386,19 +389,26 @@ def best_f_score(true_labels: Array, predictions: Array, log: bool = False) -> L
     st_points = [.00736893 * math.e ** (.421019 * x) for x in range(11)]
     st_points.extend(1. - p for p in reversed(st_points[:-1]))
 
-    # gen_scores().reduce((a, b) => (a, b).zip().map(::max(z => z[1])))
     max_threads = max(len(st_points), len(cfg.class_names))
     cpus = os.cpu_count()
     if cpus is not None and max_threads > cpus:
         max_threads = cpus
+
+    def best(a: List[Tuple[float, float]], b: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        return list(map(
+            lambda t: max(t, key=itemgetter(1)),
+            zip_strict(a, b)
+        ))
+
     with multiprocessing.Pool(max_threads) as p:
-        best_scores: List[Tuple[float, float]] = list(reduce(
-            lambda a, b: map(lambda t: max(t, key=lambda z: z[1]), # type: ignore
-                             zip_strict(a, b)),
+        best_scores = reduce(
+            best,
             p.starmap(
                 minimize_global,
                 ((true_labels, predictions, minimizer_kwargs, minimizer_bounds, st_point)
-                 for st_point in st_points))))
+                 for st_point in st_points)
+            )
+        )
 
         minimizer_kwargs['bounds'] = [constraints[0]]
 
@@ -581,7 +591,7 @@ class Metrics:
 
             if self.total_evidence is not None:
                 thresholds_ = np.asarray([t for t, s in best_f_scores])
-                match = ((self.predictions > .99) == (self.true_labels > thresholds_[None, :])).astype(np.float32)
+                match = np.equal(self.predictions > .99, self.true_labels > thresholds_[None, :]).astype(np.float32)
                 mean_evidence: Array = np.mean(self.total_evidence, axis=0)  # type: ignore[assignment]
                 mean_evidence_succ = (np.sum(self.total_evidence * match, axis=0)
                                       / np.sum(match + 1e-20, axis=0))
@@ -779,7 +789,7 @@ class MyNeuralNetClassifier(NeuralNetClassifier):
         self.initial_epoch = kwargs.pop('initial_epoch')
         super().__init__(*args, **kwargs)
 
-    # skorch: Don't setup the optimizer if we don't intend to use one
+    # skorch: Don't set up the optimizer if we don't intend to use one
     def initialize_optimizer(self: AnyNNC, triggered_directly: bool = True) -> AnyNNC:
         if self.optimizer is None:
             return self
@@ -904,11 +914,11 @@ class ResampleArgs:
             raise ValueError('Resample: Expected at most 3 arguments, got {}'.format(len(args)))
         it = iter(args)
         try:
-            if (arg := next(it)):
+            if arg := next(it):
                 kwargs['resample_limit'] = float(arg) / 100
-            if (arg := next(it)):
+            if arg := next(it):
                 kwargs['imbalance_target'] = float(arg)
-            if (arg := next(it)):
+            if arg := next(it):
                 if arg not in ('pos', 'all'):
                     raise ValueError("Resample: Expected imbalance mode of 'pos' or 'all', got '{}'".format(arg))
                 kwargs['mode'] = arg
@@ -1001,7 +1011,7 @@ class Config:
         self.noise_factor_2:      float           = 1 / 35
         self.num_workers:         int             = DEFAULT_NUM_WORKERS
         self.optimizer_kwargs:    Dict[str, Any]  = {}
-        self.optimizer_type:      Type[Any]       = object
+        self.optimizer_type:      Type[Optimizer] = UNTYPED_NONE
         self.resample:            ResampleArgs    = ResampleArgs.parse('+50')
         self.pepper_factor:       float           = 0.
         self.scheduler_kwargs:    Optional[Dict[str, Any]] = None
@@ -1018,7 +1028,7 @@ class Config:
 def get_save_state_dict(
     cfg: 'Config', options: 'MainArgParser', model_state_dict: Dict[str, Any], optimizer_state_dict: Dict[str, Any],
     scheduler: _LRScheduler, warmup_scheduler: Optional[UntunedLinearWarmup], random_state: Dict[str, Any],
-    net: MyNeuralNetClassifier,
+    net: NeuralNetClassifier,
 ) -> Dict[str, Any]:
     model = net.module_
     old_training = model.training
@@ -1062,7 +1072,7 @@ def get_save_state_dict(
     return save_dict
 
 
-def get_save_stats_dict(*, model: Module, data_transforms: Dict[str, Any], opt_eval_y_true: Array,
+def get_save_stats_dict(*, model: Module, data_transforms: Dict[str, transforms.Compose], opt_eval_y_true: Array,
                         opt_eval_y_pred: Array, opt_eval_y_u: Array, opt_eval_tot_ev: Array, test_loss: float) \
         -> Dict[str, Any]:
     script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -1124,12 +1134,12 @@ def tuple_arg(elt_typ: Callable[[str], T], sep: str = ',') -> Callable[[str], Tu
     return parse
 
 
-positive_int      = check_cond(int,   lambda v: v >  0, 'positive')
-nonnegative_int   = check_cond(int,   lambda v: v >= 0, 'nonnegative')
-positive_float    = check_cond(float, lambda v: v >  0, 'positive')
+positive_int = check_cond(int, lambda v: v > 0, 'positive')
+nonnegative_int = check_cond(int, lambda v: v >= 0, 'nonnegative')
+positive_float = check_cond(float, lambda v: v > 0, 'positive')
 nonnegative_float = check_cond(float, lambda v: v >= 0, 'nonnegative')
 nonnegative_floatexpr = check_cond(lambda s: float(eval(s)), lambda v: v >= 0, 'nonnegative')  # noqa: S307
-ratio_float       = check_cond(float, lambda v: 0 <= v <= 1, 'between zero and one, inclusive')
+ratio_float = check_cond(float, lambda v: 0 <= v <= 1, 'between zero and one, inclusive')
 
 
 class MainArgParser(Tap):
@@ -1603,7 +1613,7 @@ def main() -> None:
         image_datasets['opt'] = LabeledSubset(image_datasets['opt'], range(500))
 
     if options.task == 'preview_input':
-        cfg.num_workers = 0  # Just need a little bit of data, grab in the main thread
+        cfg.num_workers = 0  # Just need a little data, grab in the main thread
 
     def make_dataloader(dataset: LabeledDataset, transform: Callable[[Image.Image], Tensor]) -> DataLoader:
         return DataLoader(
@@ -1614,6 +1624,7 @@ def main() -> None:
         )
 
     dataloaders = {}
+    bal_train_dataset: LabeledDataset = UNTYPED_NONE
     if options.task != 'print_numels':
         if cfg.need_train_data:
             if checkpoint is None:
@@ -1727,6 +1738,7 @@ def main() -> None:
     }
     criterion_type = criterion_types[cfg.criterion]
 
+    opt_params: Optional[List[Dict[str, Any]]] = None
     if cfg.training:
         cfg.optimizer_type = checkpoint['optimizer_type'] if cfg.cont_opt else {
             'adam': AdamW,
@@ -1741,14 +1753,15 @@ def main() -> None:
             skip = model.no_weight_decay()
         opt_params = add_weight_decay(model, cfg.weight_decay or 0., skip)
 
+    nontrain_criterion: ExtraTrainLoss = UNTYPED_NONE
     if options.task != 'train':
-        criterion = criterion_type(norm_params, model, annealing_step=cfg.annealing_step)
+        nontrain_criterion = criterion_type(norm_params, model, annealing_step=cfg.annealing_step)
 
     if options.task == 'find_aug':
         model_loader.postload()
         del model_loader
         optimizer = cfg.optimizer_type(opt_params, lr=options.lr)
-        best_params = find_best_augment_params(bal_train_dataset, dataloaders, optimizer, model, device, criterion,
+        best_params = find_best_augment_params(bal_train_dataset, dataloaders, optimizer, model, device, nontrain_criterion,
                                                make_dataloader)
         print('Best augmentation parameters:\n{}'.format(best_params))
         sys.exit(0)
@@ -1924,7 +1937,7 @@ def main() -> None:
         with torch.no_grad():
             for data in tqdm(dataloaders['opt'], leave=False):
                 Xi, yi = unpack_data(data)
-                alpha  = net.evaluation_step(Xi, training=False)
+                alpha  = net.evaluation_step(Xi)
                 X_meta = pos_proba(alpha).cpu().numpy()
                 y_u    = pred_uncertainty(alpha).cpu().numpy()
                 tot_ev = torch.sum(alpha - 1, dim=-1).cpu().numpy()
@@ -1986,9 +1999,9 @@ def main() -> None:
     model.eval()
 
     if options.task == 'visualize':
-        print_predictions(model, criterion, eval_checkpoint)
+        print_predictions(model, nontrain_criterion, eval_checkpoint)
     elif options.task == 'metrics':
-        Metrics().metrics_eval(model, criterion, eval_checkpoint)
+        Metrics().metrics_eval(model, nontrain_criterion, eval_checkpoint)
     elif options.task == 'eval_test':
         assert options.eval_dir is not None
         try:
@@ -1996,7 +2009,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        Metrics().test_eval(model, criterion, eval_checkpoint)
+        Metrics().test_eval(model, nontrain_criterion, eval_checkpoint)
     elif options.task == 'get_correct':
         assert options.correct_dir is not None
         try:
@@ -2004,7 +2017,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        Metrics().correct_eval(model, criterion, eval_checkpoint, data_cnames)
+        Metrics().correct_eval(model, nontrain_criterion, eval_checkpoint, data_cnames)
     elif options.task == 'roc':
         assert options.fig_dir is not None
         try:
@@ -2012,7 +2025,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        roc_eval(model, criterion, options.fig_dir, eval_checkpoint)
+        roc_eval(model, nontrain_criterion, options.fig_dir, eval_checkpoint)
     else:
         raise AssertionError('Invalid task!')
 

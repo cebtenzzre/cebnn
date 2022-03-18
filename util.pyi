@@ -19,10 +19,6 @@ class FakeGenericMeta(type):
     def __getitem__(cls, item: Any) -> Any: ...
 
 
-class FakeGenericABCMeta(FakeGenericMeta, ABCMeta):
-    pass
-
-
 class SizedIterable(Sized, Iterable[T], metaclass=ABCMeta):
     pass
 

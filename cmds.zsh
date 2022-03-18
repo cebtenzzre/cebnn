@@ -167,7 +167,7 @@ _lint() {
   mypy --python-executable="$(which python)" || return 1
 
   (( $# )) || return
-  pytype -V 3.8 -j auto --keep-going --strict_namedtuple_checks --precise-return "$@"
+  pytype -j auto --keep-going --strict_namedtuple_checks --precise-return "$@"
   flake8 --max-line-length=120 --select=F,U100,E501,W291 --ignore=F811 "$@"
 }
 
