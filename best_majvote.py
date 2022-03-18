@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.8
+#!/usr/bin/env python3.10
 # -*- coding: utf-8 -*-
 
 # pytype: skip-file
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Generic, TypedDict, TypeVar, Union
 
 import numba as nb
 import numpy as np
+from numpy.typing import NDArray
 from scipy.stats import PearsonRConstantInputWarning, pearsonr
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
@@ -28,12 +29,18 @@ if TYPE_CHECKING:
     from typing import Any, Collection, Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
 T = TypeVar('T')
-DType = TypeVar('DType', bound='np.dtype[Any]')
-BoolArray = Union['np.ndarray[Any, np.dtype[np.bool_]]']
-IntArray = Union['np.ndarray[Any, np.dtype[np.int64]]']
-FloatArray = Union['np.ndarray[Any, np.dtype[np.float32]]']
-SharedIntArray = Union['SharedArray[np.dtype[np.int64]]']
-SharedFloatArray = Union['SharedArray[np.dtype[np.float32]]']
+CTypeable = Union[
+    np.bool_,
+    np.byte, np.short, np.intc, np.int_, np.longlong,
+    np.ubyte, np.ushort, np.uintc, np.uint, np.ulonglong,
+    np.single, np.double, np.longdouble,
+]
+SCT = TypeVar('SCT', bound=CTypeable, covariant=True)
+DTypeLike = Union[np.dtype[SCT], type[SCT]]
+IntArray = NDArray[np.int64]
+FloatArray = NDArray[np.float32]
+SharedIntArray = SharedArray[np.int64]
+SharedFloatArray = SharedArray[np.float32]
 
 
 MIN_LEN = 3
@@ -54,34 +61,36 @@ class WorkerVars(TypedDict, total=False):
     numpy_err_gy: List[Any]
 
 
-class SharedArray(Generic[DType]):
+class SharedArray(Generic[SCT]):
     __slots__ = ('data', 'dtype', 'shape')
 
     data: ctypes.Array[Any]
-    dtype: DType
+    dtype: np.dtype[SCT]
     shape: Tuple[int, ...]
 
-    def __init__(self, dtype: DType, shape: Tuple[int, ...]) -> None:
+    def __init__(self, dtype: np.dtype[SCT], shape: Tuple[int, ...]) -> None:
+        # NB: would use as_ctypes_type but mypy seems confused by the overloads
         ctype = type(np.ctypeslib.as_ctypes(dtype.type()))
         self.data = RawArray(ctype, np.prod(shape).item())
         self.dtype = dtype
         self.shape = shape
 
-    def numpy(self) -> np.ndarray[Any, DType]:
-        return np.frombuffer(self.data, dtype=self.dtype).reshape(*self.shape)
+    def numpy(self) -> NDArray[SCT]:
+        # NB: memoryview is needed to convince mypy that data is bytes-like
+        return np.frombuffer(memoryview(self.data), dtype=self.dtype).reshape(*self.shape)
 
     @classmethod
-    def fromnumpy(cls, arr: np.ndarray[Any, DType]) -> SharedArray[DType]:
+    def fromnumpy(cls, arr: NDArray[SCT]) -> SharedArray[SCT]:
         obj = cls(arr.dtype, arr.shape)
         np.copyto(obj.numpy(), arr, casting='no')
         return obj
 
     @classmethod
-    def fromiter(cls, it: Iterable[Any], dtype: Union[Type[np.generic], np.dtype[Any]]) -> SharedArray[DType]:
+    def fromiter(cls, it: Iterable[Any], dtype: DTypeLike[SCT]) -> SharedArray[SCT]:
         return cls.fromnumpy(np.asarray(tuple(it), dtype=dtype))
 
 
-def corr(a: np.ndarray[Any, Any], b: np.ndarray[Any, Any]) -> np.float64:
+def corr(a: NDArray[np.generic], b: NDArray[np.generic]) -> np.float64:
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=PearsonRConstantInputWarning)  # Acceptable
         return pearsonr(a, b)[0]
@@ -156,7 +165,7 @@ def mode_uthr(pt: Tuple[IntArray, ...], u: Tuple[FloatArray, ...], uthr: float) 
     ex_count = np.zeros(shape=p.shape[1], dtype=np.int64)
     for i in range(len(p)):
         # Threshold uncertainty on uthr
-        ex: BoolArray = u[i] > uthr
+        ex = u[i] > uthr
         # Exclude the respective elements of p
         p[i][ex] = 0
         ex_count += ex.astype(np.int64)

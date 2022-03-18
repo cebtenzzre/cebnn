@@ -4,10 +4,10 @@ A personal project I use to train neural networks. See cmds.zsh for the kinds of
 
 ## Setup
 
-1. Install python 3.8
+1. Install python 3.10
 2. Create a venv:
 ```
-python3.8 -m venv .venv --system-site-packages
+python3.10 -m venv .venv --system-site-packages
 ```
 3. Activate the venv:
 ```
@@ -17,6 +17,7 @@ source .venv/bin/activate
 ```
 pip install -r requirements.txt
 ```
+torchvision may need to be installed outside of pip if it fails to build.
 
 ## Basic usage example
 

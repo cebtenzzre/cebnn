@@ -175,8 +175,8 @@ def main() -> None:
     trainable_y = y
     trainable_groups = groups
     test_only_X: List[str] = []
-    test_only_y = np.array([])
-    test_only_groups = np.array([])
+    test_only_y: Array = np.array([])
+    test_only_groups: Array = np.array([])
     if os.path.isdir('test_only'):
         exclude = dir_to_file_set('test_only')
         test_only_X, test_only_y, test_only_groups = filter_dataset(X, y, groups, lambda Xi, _: Xi in exclude)

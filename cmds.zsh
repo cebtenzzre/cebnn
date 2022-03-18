@@ -114,7 +114,7 @@ alias mcc='sorted_metric "MCC"'
 alias roc_auc='sorted_metric "ROC AUC"'
 
 printnet() {
-  python3.8 - "$1" <<'EOF' | jq
+  python3.10 - "$1" <<'EOF' | jq
 import json, sys, torch
 from torchvision import transforms
 def default(o):
@@ -125,7 +125,7 @@ EOF
 }
 
 printhist() {
-  python3.8 - "$1" <<'EOF'
+  python3.10 - "$1" <<'EOF'
 import sys, torch
 from collections import namedtuple
 from skorch.callbacks import PrintLog
@@ -138,7 +138,7 @@ EOF
 }
 
 printnet_full() {
-  python3.8 - "$1" <<'EOF' | jq
+  python3.10 - "$1" <<'EOF' | jq
 import dis, json, sys, torch, types
 from torchvision import transforms
 def default(o):

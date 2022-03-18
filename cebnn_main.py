@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.8
+#!/usr/bin/env python3.10
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     AnyResampleArgs = TypeVar('AnyResampleArgs', bound='ResampleArgs')
     AnyRLS = TypeVar('AnyRLS', bound='ResampledLabeledSubset')
     AnyDataset = Union[Dataset[Any]]
+    AnyNNC = TypeVar('AnyNNC', bound='MyNeuralNetClassifier')
 
 T = TypeVar('T')
 
@@ -723,7 +724,7 @@ class TrainerCallback(Callback):
                 self.scheduler.step(self.cur_epoch)
             self.warmup_scheduler.dampen()
 
-    def on_batch_end(self, net: NeuralNetClassifier, X: object = None, y: object = None,  # noqa: U100
+    def on_batch_end(self, net: NeuralNetClassifier, batch: object = None,  # noqa: U100
                      training: Optional[bool] = None, **kwargs: object) -> None:  # noqa: U100
         # CosineAnnealingLR-based scheduler
         if training and isinstance(self.scheduler, CyclicLRWithRestarts):
@@ -773,42 +774,44 @@ class MyNeuralNetClassifier(NeuralNetClassifier):
         super().__init__(*args, **kwargs)
 
     # skorch: Don't setup the optimizer if we don't intend to use one
-    def initialize_optimizer(self, triggered_directly: bool = True) -> None:
+    def initialize_optimizer(self: AnyNNC, triggered_directly: bool = True) -> AnyNNC:
         if self.optimizer is None:
-            return
-        super().initialize_optimizer(triggered_directly=triggered_directly)
+            return self
+        return super().initialize_optimizer(triggered_directly=triggered_directly)
 
     # SciKit-Learn: Don't clone me, I'm fragile (and big)
     def __deepcopy__(self, _memo: Dict[int, object]) -> NoReturn:
         raise RuntimeError('plz no')
 
     # Passes epoch to get_loss
-    def validation_step(self, Xi: Tensor, yi: Tensor, **fit_params: Any) -> Dict[str, Any]:
+    def validation_step(self, batch: Any, **fit_params: Any) -> Dict[str, Any]:
         epoch: int = fit_params.pop('epoch')
         self.module_.eval()
+        Xi, yi = unpack_data(batch)
         with torch.no_grad():
             y_pred = self.infer(Xi, **fit_params)
             loss = self._get_loss(y_pred, yi, epoch)
         return {'loss': loss, 'y_pred': y_pred}
 
     # Passes epoch to get_loss
-    def train_step_single(self, Xi: Tensor, yi: Tensor, **fit_params: Any) -> Dict[str, Any]:
+    def train_step_single(self, batch: Any, **fit_params: Any) -> Dict[str, Any]:
         epoch: int = fit_params.pop('epoch')
         self.module_.train()
+        Xi, yi = unpack_data(batch)
         y_pred = self.infer(Xi, **fit_params)
         loss = self._get_loss(y_pred, yi, epoch)
         loss.backward()
 
-        self.notify('on_grad_computed', named_parameters=TeeGenerator(self.module_.named_parameters()), X=Xi, y=yi)
         return {'loss': loss, 'y_pred': y_pred}
 
     # Modified train_step that avoids classic zero_grad
     # See https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
-    def train_step(self, Xi: Tensor, yi: Tensor, **fit_params: Any) -> Dict[str, Any]:
+    def train_step(self, batch: Any, **fit_params: Any) -> Dict[str, Any]:
         step_accumulator = self.get_train_step_accumulator()
         def step_fn() -> Tensor:
-            step = self.train_step_single(Xi, yi, **fit_params)
+            step = self.train_step_single(batch, **fit_params)
             step_accumulator.store_step(step)
+            self.notify('on_grad_computed', named_parameters=TeeGenerator(self.module_.named_parameters()), batch=batch)
             return step['loss']
         self.optimizer_.step(step_fn)
         for param in self.module_.parameters():
