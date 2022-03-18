@@ -58,7 +58,7 @@ from cebnn_common import (CatModel, ModelLoader, model_supports_resnet_d, parse_
                           pred_uncertainty)
 from datamunge import ImbalancedDatasetSampler
 from dataset import LabeledDataset, LabeledSubset, MultiLabelCSVDataset, TransformedDataset
-from losses import EDL_Digamma_Loss, EDL_Log_Loss, EDL_Loss, EDL_MSE_Loss
+from losses import EDL_Digamma_Loss, EDL_Log_Loss, EDL_MSE_Loss
 from sgdw import SGDW
 from util import zip_strict
 
@@ -171,71 +171,78 @@ def extra_train_loss(base_loss: Tensor, extra_loss: Tensor) -> Tensor:
     return ExtraTrainLoss.apply(base_loss, extra_loss)
 
 
-def extra_tloss_criterion(base_type: Type[Module]) -> Type[Any]:
-    assert issubclass(base_type, nn.Module)
+class ExtraTrainLossMixin(nn.Module):
+    def __init__(self, norm_params: Sequence[nn.Parameter], model: Module, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._norm_params = norm_params
+        self._model = model
+        self.register_buffer('zero', torch.zeros((), device=device))
+        if options.l1reg is not None:
+            self.register_buffer('l1reg', torch.tensor(options.l1reg, device=device))
+        if options.l2reg is not None:
+            self.register_buffer('l2reg', torch.tensor(options.l2reg, device=device))
+        if options.corrreg is not None:
+            self.register_buffer('corrreg', torch.tensor(options.corrreg, device=device))
 
-    class ExtraTLossCriterion(base_type):  # type: ignore[misc, valid-type]
-        def __init__(self, norm_params: Sequence[nn.Parameter], model: Module, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self._norm_params = norm_params
-            self._model = model
-            self.register_buffer('zero', torch.zeros((), device=device))
-            if options.l1reg is not None:
-                self.register_buffer('l1reg', torch.tensor(options.l1reg, device=device))
-            if options.l2reg is not None:
-                self.register_buffer('l2reg', torch.tensor(options.l2reg, device=device))
-            if options.corrreg is not None:
-                self.register_buffer('corrreg', torch.tensor(options.corrreg, device=device))
+    def forward(self, pred: Tensor, target: Tensor, epoch: int) -> Tensor:
+        base_loss: Tensor = super().forward(pred, target, epoch)
 
-        def forward(self, pred: Tensor, target: Tensor, epoch: int) -> Tensor:
-            base_loss: Tensor = super().forward(pred, target, epoch)
+        if not torch.is_grad_enabled():
+            return base_loss  # Only apply extra loss while training
+        if options.l1reg is None and options.l2reg is None and options.corrreg is None:
+            return base_loss  # No extra loss needed
 
-            if not torch.is_grad_enabled():
-                return base_loss  # Only apply extra loss while training
-            if options.l1reg is None and options.l2reg is None and options.corrreg is None:
-                return base_loss  # No extra loss needed
+        def lp_loss(p: int, reg: Tensor) -> Tensor:
+            return sum((grad_scale(np, reg).norm(p=p) for np in self._norm_params),
+                       start=self.zero)
 
-            def lp_loss(p: int, reg: Tensor) -> Tensor:
-                return sum((grad_scale(np, reg).norm(p=p) for np in self._norm_params),
-                           start=self.zero)
+        l1_loss = l2_loss = corr_loss = self.zero
 
-            l1_loss = l2_loss = corr_loss = self.zero
+        if options.l1reg is not None:
+            l1_loss = lp_loss(1, self.l1reg)
+        if options.l2reg is not None:
+            l2_loss = lp_loss(2, self.l2reg)
 
-            if options.l1reg is not None:
-                l1_loss = lp_loss(1, self.l1reg)
-            if options.l2reg is not None:
-                l2_loss = lp_loss(2, self.l2reg)
+        # Correlation loss (see https://doi.org/10.1007/978-3-319-68612-7_6)
+        def layer_corr_loss(layer_weights: Tensor, reg: Tensor) -> float:
+            lw = grad_scale(layer_weights, reg)  # Gradient scale factor
+            assert len(lw.size()) == 4  # Conv2d expected
+            kernels = lw.view(-1, *lw.size()[:-2])
 
-            # Correlation loss (see https://doi.org/10.1007/978-3-319-68612-7_6)
-            def layer_corr_loss(layer_weights: Tensor, reg: Tensor) -> float:
-                lw = grad_scale(layer_weights, reg)  # Gradient scale factor
-                assert len(lw.size()) == 4  # Conv2d expected
-                kernels = lw.view(-1, *lw.size()[:-2])
+            return sum(self._pearsonr(si.flatten(), sj.flatten()) ** 2
+                       for si, sj in combinations(kernels, 2))
 
-                return sum(self._pearsonr(si.flatten(), sj.flatten()) ** 2
-                           for si, sj in combinations(kernels, 2))
+        if options.corrreg is not None:
+            corr_loss_layers = (
+                l for l in self._model.modules()
+                if isinstance(l, nn.Conv2d) and l.weight.requires_grad and any(s > 1 for s in l.kernel_size)
+            )
+            corr_loss = sum(layer_corr_loss(l.weight, self.corrreg) for l in corr_loss_layers)
 
-            if options.corrreg is not None:
-                corr_loss_layers = (
-                    l for l in self._model.modules()
-                    if isinstance(l, nn.Conv2d) and l.weight.requires_grad and any(s > 1 for s in l.kernel_size)
-                )
-                corr_loss = sum(layer_corr_loss(l.weight, self.corrreg) for l in corr_loss_layers)
+        extra_loss = l1_loss + l2_loss + corr_loss
+        assert base_loss.shape == extra_loss.shape
+        return extra_train_loss(base_loss, extra_loss)
 
-            extra_loss = l1_loss + l2_loss + corr_loss
-            assert base_loss.shape == extra_loss.shape
-            return extra_train_loss(base_loss, extra_loss)
+    # From https://github.com/pytorch/pytorch/issues/1254
+    @staticmethod
+    def _pearsonr(x: Tensor, y: Tensor) -> float:
+        xm = x.sub(x.mean())
+        ym = y.sub(y.mean())
+        r_num = xm.dot(ym)
+        r_den = xm.norm(2) * ym.norm(2)
+        return r_num / r_den
 
-        # From https://github.com/pytorch/pytorch/issues/1254
-        @staticmethod
-        def _pearsonr(x: Tensor, y: Tensor) -> float:
-            xm = x.sub(x.mean())
-            ym = y.sub(y.mean())
-            r_num = xm.dot(ym)
-            r_den = xm.norm(2) * ym.norm(2)
-            return r_num / r_den
 
-    return ExtraTLossCriterion
+class EDL_MSE_Loss_Extra(ExtraTrainLossMixin, EDL_MSE_Loss):
+    pass
+
+
+class EDL_Log_Loss_Extra(ExtraTrainLossMixin, EDL_Log_Loss):
+    pass
+
+
+class EDL_Digamma_Loss_Extra(ExtraTrainLossMixin, EDL_Digamma_Loss):
+    pass
 
 
 def prestep_clipping_optimizer(base_type: Type[Optimizer]) -> Type[Any]:
@@ -1715,9 +1722,10 @@ def main() -> None:
     norm_params = get_norm_params()
 
     # Criterion is the loss function of our model.
-    criterion_types: Dict[str, Type[EDL_Loss]] = {'mse': EDL_MSE_Loss, 'log': EDL_Log_Loss, 'digamma': EDL_Digamma_Loss}
-    base_criterion_type = criterion_types[cfg.criterion]
-    criterion_type = extra_tloss_criterion(base_criterion_type)
+    criterion_types: Dict[str, Type[ExtraTrainLoss]] = {
+        'mse': EDL_MSE_Loss_Extra, 'log': EDL_Log_Loss_Extra, 'digamma': EDL_Digamma_Loss_Extra,
+    }
+    criterion_type = criterion_types[cfg.criterion]
 
     if cfg.training:
         cfg.optimizer_type = checkpoint['optimizer_type'] if cfg.cont_opt else {
