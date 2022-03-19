@@ -52,7 +52,7 @@ from tqdm import tqdm
 import mypickle
 from aadamw01 import AAdamW01
 from adamwr.adamw import AdamW
-from adamwr.cyclic_scheduler import CyclicLRWithRestarts, ReduceMaxLROnRestart
+from adamwr.cyclic_scheduler import CyclicLRWithRestarts
 from algorithm import fbeta_like_geo_youden, multilabel_confusion_matrix
 from augment import MayResize, find_best_augment_params, make_data_transform
 from cebnn_common import (CatModel, ModelLoader, model_supports_resnet_d, parse_sublayer_ratio, pos_proba,
@@ -89,6 +89,7 @@ DEFAULT_BATCH_SIZE = 16
 DEFAULT_ANNEALING_STEP = 10
 DEFAULT_OPTIMIZER = 'adam'
 DEFAULT_SCHEDULER = 'linear'
+DEFAULT_SCH_PERIOD = 1
 DEFAULT_SEED = 42
 DEFAULT_NUM_WORKERS = 4
 UNTYPED_NONE: Any = None
@@ -884,6 +885,20 @@ class MySGDW(SGDW):
         super().__init__(*args, **kwargs)
 
 
+class MyReduceMaxLROnRestart:
+    def __init__(self, ratio: float, period: int = 1) -> None:
+        self.ratio = ratio
+        self.period = period
+        self.iter = 0
+
+    def __call__(self, eta_min: float, eta_max: float) -> tuple[float, float]:
+        self.iter += 1
+        if self.iter >= self.period:
+            eta_max *= self.ratio
+            self.iter = 0
+        return eta_min, eta_max
+
+
 def isclose_nested(a: Union[Tuple[Any, ...], float], b: Union[Tuple[Any, ...], float]) -> bool:
     if isinstance(a, tuple):
         assert isinstance(b, tuple)
@@ -1182,6 +1197,7 @@ class MainArgParser(Tap):
     lr: Optional[float] = None  # Learning rate
     gamma: Optional[float] = None  # Gamma parameter of scheduler
     gamma_override: Optional[float] = None  # Override restart gamma
+    sch_period: Optional[int] = None  # Scheduler period in epochs
     wd: Optional[float] = None  # Weight decay
     resnet_d: bool = False  # Apply Resnet-D to trained sublayers
     l1reg: Optional[float] = None  # L1 regularization factor
@@ -1229,6 +1245,7 @@ class MainArgParser(Tap):
         self.add_argument('--lr', type=positive_float)
         self.add_argument('--gamma', type=positive_float, metavar='γ')
         self.add_argument('--gamma-override', type=positive_float, metavar='γ')
+        self.add_argument('--sch-period', type=positive_int, metavar='N')
         self.add_argument('--wd', type=ratio_float)
         self.add_argument('--l1reg', type=positive_float, metavar='FACTOR')
         self.add_argument('--l2reg', type=positive_float, metavar='FACTOR')
@@ -1353,8 +1370,10 @@ def main() -> None:
 
     if options.optimizer is not None and (not cfg.training or cfg.cont_opt):
         parser.error('--optimizer is only valid if training and optimizer state will not be loaded')
-    if options.scheduler is not None and (options.task != 'train' or cfg.cont_sch):
-        parser.error('--scheduler is only valid if training and scheduler state will not be loaded')
+    if (options.task != 'train' or cfg.cont_sch):
+        for opt in ('scheduler', 'gamma', 'sch-period'):
+            if getattr(options, opt.replace('-', '_')) is not None:
+                parser.error('--{} is only valid if training and scheduler state will not be loaded'.format(opt))
     if options.lr_warmup:
         if options.task != 'train' or cfg.cpload:
             parser.error('--lr-warmup is only valid if training and a checkpoint will not be loaded')
@@ -1761,8 +1780,8 @@ def main() -> None:
         model_loader.postload()
         del model_loader
         optimizer = cfg.optimizer_type(opt_params, lr=options.lr)
-        best_params = find_best_augment_params(bal_train_dataset, dataloaders, optimizer, model, device, nontrain_criterion,
-                                               make_dataloader)
+        best_params = find_best_augment_params(bal_train_dataset, dataloaders, optimizer, model, device,
+                                               nontrain_criterion, make_dataloader)
         print('Best augmentation parameters:\n{}'.format(best_params))
         sys.exit(0)
 
@@ -1810,18 +1829,22 @@ def main() -> None:
                 print('==> Loaded scheduler state from checkpoint.')
         else:
             cfg.scheduler_name = DEFAULT_SCHEDULER if options.scheduler is None else options.scheduler
+            sch_period = options.sch_period or DEFAULT_SCH_PERIOD
+            assert options.gamma is not None
             if cfg.scheduler_name == 'cyclic':
                 cfg.scheduler_type = CyclicLRWithRestarts
                 cfg.scheduler_kwargs = {'batch_size': cfg.batch_size, 'epoch_size': get_len(bal_train_dataset),
                                         'restart_period': 1, 't_mult': 1,
-                                        'eta_on_restart_cb': ReduceMaxLROnRestart(ratio=options.gamma),
+                                        'eta_on_restart_cb': MyReduceMaxLROnRestart(
+                                            ratio=options.gamma, period=sch_period
+                                        ),
                                         'policy': 'cosine' if options.schpolicy is None else options.schpolicy}
             elif cfg.scheduler_name == 'cosine':
                 cfg.scheduler_type = CosineAnnealingLR
                 cfg.scheduler_kwargs = {'T_max': cfg.epochs}
             elif cfg.scheduler_name == 'linear':
                 cfg.scheduler_type = StepLR
-                cfg.scheduler_kwargs = {'step_size': 1, 'gamma': options.gamma}
+                cfg.scheduler_kwargs = {'step_size': sch_period, 'gamma': options.gamma}
             elif cfg.scheduler_name == 'NONE':
                 cfg.scheduler_type = None
                 cfg.scheduler_kwargs = None
