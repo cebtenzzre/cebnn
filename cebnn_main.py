@@ -476,7 +476,7 @@ def evaluate(model: Module, loss_func: Module, checkpoint: Dict[str, Any], log: 
     elif (
         options.test_with_cpickle_thr is None
         and not options.ignore_cpeval
-        and checkpoint.get('opt_eval_dataset') in (None, options.data_dir)
+        and checkpoint.get('opt_eval_dataset') in (None, cfg.data_cv_dir)
     ):
         try:
             return (checkpoint['opt_eval_y_pred'], checkpoint['opt_eval_y_u'], checkpoint['opt_eval_tot_ev'],
@@ -1001,7 +1001,14 @@ class ResampledLabeledSubset(LabeledDataset):
 
 
 class Config:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        data_cv_dir: str,
+        seed_value: int,
+    ) -> None:
+        self.data_cv_dir = data_cv_dir
+        self.seed_value = seed_value
+
         self.annealing_step:      int             = DEFAULT_ANNEALING_STEP
         self.base_model:          Optional[Union[str, Tuple[str, ...]]] = None
         self.batch_size:          int             = DEFAULT_BATCH_SIZE
@@ -1032,7 +1039,6 @@ class Config:
         self.scheduler_kwargs:    Optional[Dict[str, Any]] = None
         self.scheduler_name:      str             = ''
         self.scheduler_type:      Optional[Type[_LRScheduler]] = None
-        self.seed_value:          int             = DEFAULT_SEED
         self.sublayer_ratio:      Optional[Union[float, Tuple[float, float], Tuple[Tuple[float, float], ...]]] = None
         self.training:            bool            = False
         self.tta_mode:            str             = ''
@@ -1041,8 +1047,14 @@ class Config:
 
 
 def get_save_state_dict(
-    cfg: 'Config', options: 'MainArgParser', model_state_dict: Dict[str, Any], optimizer_state_dict: Dict[str, Any],
-    scheduler: _LRScheduler, warmup_scheduler: Optional[UntunedLinearWarmup], random_state: Dict[str, Any],
+    *,
+    cfg: 'Config',
+    options: 'MainArgParser',
+    model_state_dict: Dict[str, Any],
+    optimizer_state_dict: Dict[str, Any],
+    scheduler: _LRScheduler,
+    warmup_scheduler: Optional[UntunedLinearWarmup],
+    random_state: Dict[str, Any],
     net: NeuralNetClassifier,
 ) -> Dict[str, Any]:
     model = net.module_
@@ -1087,9 +1099,17 @@ def get_save_state_dict(
     return save_dict
 
 
-def get_save_stats_dict(*, model: Module, data_transforms: Dict[str, transforms.Compose], opt_eval_y_true: Array,
-                        opt_eval_y_pred: Array, opt_eval_y_u: Array, opt_eval_tot_ev: Array, test_loss: float) \
-        -> Dict[str, Any]:
+def get_save_stats_dict(
+    *,
+    cfg: 'Config',
+    model: Module,
+    data_transforms: Dict[str, transforms.Compose],
+    opt_eval_y_true: Array,
+    opt_eval_y_pred: Array,
+    opt_eval_y_u: Array,
+    opt_eval_tot_ev: Array,
+    test_loss: float
+) -> Dict[str, Any]:
     script_dir = os.path.dirname(os.path.realpath(__file__))
 
     def gitcmd(*args: Any) -> str:
@@ -1106,7 +1126,7 @@ def get_save_stats_dict(*, model: Module, data_transforms: Dict[str, transforms.
         'revision': 'r{}.{}'.format(gitcmd('rev-list', '--count', 'HEAD'),
                                     gitcmd('rev-parse', '--short', 'HEAD')),
         'data_transforms': data_transforms,
-        'opt_eval_dataset': options.data_dir,
+        'opt_eval_dataset': cfg.data_cv_dir,
         'opt_eval_y_true': opt_eval_y_true,
         'opt_eval_y_pred': opt_eval_y_pred,
         'opt_eval_y_u': opt_eval_y_u,
@@ -1163,6 +1183,7 @@ class MainArgParser(Tap):
     """What to do with the neural network"""
 
     data_dir: str  # Dataset location
+    cv_fold: int  # Fold of cross validator to use
     load: Optional[Tuple[str, ...]] = None  # type: ignore[assignment]
     save: Optional[str] = None  # type: ignore[assignment]
     resample: Optional[str] = None  # Pre-split resample arguments
@@ -1225,8 +1246,8 @@ class MainArgParser(Tap):
 
     def configure(self) -> None:
         self.add_argument('--data-dir', metavar='DIR')
-        self.add_argument('--load', type=tuple_arg(str, sep=';'), metavar='FILE',
-                          help='Load a checkpoint from FILE')
+        self.add_argument('--cv-fold', metavar='N', type=nonnegative_int)
+        self.add_argument('--load', type=tuple_arg(str, sep=';'), metavar='FILE', help='Load a checkpoint from FILE')
         self.add_argument('--save', metavar='FILE', help='Save a checkpoint to FILE')
         self.add_argument('--resample', metavar='ARGS')
         self.add_argument('--noise-factors', type=tuple_arg(nonnegative_floatexpr), metavar='FACTORS')
@@ -1268,8 +1289,10 @@ def main() -> None:
     parser = MainArgParser(underscores_to_dashes=True)
     options = parser.parse_args()
 
-    cfg = Config()
-    cfg.seed_value = options.seed
+    cfg = Config(
+        data_cv_dir=os.path.join(options.data_dir, 'fold{}'.format(options.cv_fold)),
+        seed_value=options.seed,
+    )
     seed_all(cfg.seed_value)
 
     # The number of requested models. Note: This may be one model which has submodels.
@@ -1572,7 +1595,8 @@ def main() -> None:
     else:
         cfg.tta_mode = 'none' if options.tta is None else options.tta
 
-    print("==> Dataset: '{}'".format(options.data_dir))
+    print("==> Dataset: {!r}".format(options.data_dir))
+    print("==> CV fold: {}".format(options.cv_fold))
 
     data_transforms = {}
     if checkpoint is not None:
@@ -1623,7 +1647,7 @@ def main() -> None:
     image_datasets: Dict[str, LabeledDataset] = {
         x: MultiLabelCSVDataset(
             cfg.class_names,
-            os.path.join(options.data_dir, '{}_tagged.csv'.format(x)),
+            os.path.join(cfg.data_cv_dir, '{}_tagged.csv'.format(x)),
             os.path.join(options.data_dir, 'images'),
         ) for x in ('train', 'opt', 'test')}
 
@@ -1999,6 +2023,7 @@ def main() -> None:
                     net=net,
                 )
             save_dict.update(get_save_stats_dict(
+                cfg=cfg,
                 model=model,
                 data_transforms=data_transforms,
                 opt_eval_y_true=opt_eval_y_true,
