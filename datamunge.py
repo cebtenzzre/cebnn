@@ -14,7 +14,7 @@ from torch.utils.data.sampler import Sampler
 from algorithm import ml_ros, ml_rus, mlenn, mltl
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
+    from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Sized, Tuple, Union
     from util import Array
     Algorithm = Tuple[bool, Callable[..., List[int]]]
 
@@ -129,15 +129,21 @@ def MLStratifiedGroupKFold(n_labels: int, n_splits: int = 3, \
                            random_state: Optional[Union[int, RandomState]] = None,
                            fold_ratios: Optional[Sequence[float]] = None) -> _BaseKFold:
     if n_labels > 1:
-        if False:
-            return IterativeStratification(n_splits=n_splits, order=n_labels, random_state=random_state,
-                                           sample_distribution_per_fold=fold_ratios)
-        raise NotImplementedError("I haven't decided on a good way to do this yet")
-    return MyStratifiedGroupKFold(n_splits=n_splits, fold_ratios=fold_ratios)
+        return MyIterativeStratification(n_splits=n_splits, order=n_labels, random_state=random_state,
+                                         sample_distribution_per_fold=fold_ratios)
+    return MyStratifiedGroupKFold(n_splits=n_splits, random_state=random_state, fold_ratios=fold_ratios)
+
+
+class MyIterativeStratification(IterativeStratification):
+    def split(self, X: Sized, y: Optional[object] = None, groups: Optional[Sequence[object]] = None) \
+            -> Iterator[tuple[Array, Array]]:
+        if groups is not None and (len(groups) < len(X) or len(set(groups)) < len(groups)):
+            raise NotImplementedError("I haven't decided on a good way to do this yet")
+        return super().split(X, y)
 
 
 class MyStratifiedGroupKFold(StratifiedGroupKFold):
-    def __init__(self, n_splits: int = 5, shuffle: bool = False, random_state: Optional[Union[int, RandomState]] = None,
+    def __init__(self, n_splits: int, shuffle: bool = False, random_state: Optional[Union[int, RandomState]] = None,
                  fold_ratios: Optional[Sequence[float]] = None) -> None:
         super().__init__(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
         if fold_ratios is None:
