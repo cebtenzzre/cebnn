@@ -19,6 +19,7 @@ from util import Array, zip_strict
 if TYPE_CHECKING:
     StrPath = Union[str, 'os.PathLike[str]']
 
+ORIG_DIR = 'orig'
 CLASS_DIR = 'class'
 WEIGHT_DIR = 'weight'
 
@@ -65,11 +66,6 @@ def write_file(fold: int, name: str, samples: Iterable[str], labels: Dict[str, S
             writer.writerow([fname, ' '.join(f_labels)])
         for fname in samples:
             write(fname)
-
-
-def file2lines(file: str) -> Iterator[str]:
-    with open(file) as f:
-        yield from (l.rstrip('\n') for l in f)
 
 
 # NB: groups are retained but not enforced
@@ -149,7 +145,8 @@ def main() -> None:
     with os.scandir(CLASS_DIR) as it:
         labels = {entry.name: dir_to_file_set(entry) for entry in it if entry.is_dir()}
 
-    X = list(file2lines('all.txt'))
+    with os.scandir(ORIG_DIR) as it:
+        X = list(entry.name for entry in it)
     tags = [
         [l for l, membs in labels.items() if fname in membs]
         for fname in X
