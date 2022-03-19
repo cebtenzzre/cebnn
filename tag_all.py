@@ -170,12 +170,10 @@ def main() -> None:
     trainable_X = X
     trainable_y = y
     trainable_groups = groups
-    test_only_X: List[str] = []
-    test_only_y: Array = np.array([])
-    test_only_groups: Array = np.array([])
+    test_only: Optional[tuple[List[str], Array, Array]] = None
     if os.path.isdir('test_only'):
         exclude = dir_to_file_set('test_only')
-        test_only_X, test_only_y, test_only_groups = filter_dataset(X, y, groups, lambda Xi, _: Xi in exclude)
+        test_only = filter_dataset(X, y, groups, lambda Xi, _: Xi in exclude)
         trainable_X, trainable_y, trainable_groups = filter_dataset(X, y, groups, lambda Xi, _: Xi not in exclude)
 
     datafiles: Dict[str, List[str]] = {}
@@ -185,9 +183,11 @@ def main() -> None:
         datafiles.clear()
         datafiles['train'] = train_X
 
-        not_train_X.extend(test_only_X)
-        not_train_y      = np.concatenate((not_train_y,      test_only_y))  # type: ignore[no-untyped-call]
-        not_train_groups = np.concatenate((not_train_groups, test_only_groups))  # type: ignore[no-untyped-call]
+        if test_only is not None:
+            test_only_X, test_only_y, test_only_groups = test_only
+            not_train_X.extend(test_only_X)
+            not_train_y = np.concatenate((not_train_y, test_only_y))
+            not_train_groups = np.concatenate((not_train_groups, test_only_groups))
         not_train_X, not_train_y, not_train_groups = shuffle_dataset(not_train_X, not_train_y, not_train_groups)
 
         opt_X, test_X, opt_y, test_y, _, _ = next(split(not_train_X, not_train_y, not_train_groups, test_size=.5))
