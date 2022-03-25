@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
+from augment import MayResize
 from cebnn_common import CatModel, ModelLoader, pos_proba, pred_uncertainty
 from scale import load_and_scale
 from util import zip_strict
@@ -33,8 +34,6 @@ BATCH_SIZE = 64
 WRITE_SIZE = 200  # In batches
 NUM_WORKERS = 12
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-MAX_SAMPLE_DIM = 32 * 1024
-CROP_FACTOR = .7  # Max crop of longer dimension
 
 
 class ImageDataset(Dataset):
@@ -56,10 +55,10 @@ class ImageDataset(Dataset):
 
 @torch.no_grad()  # type: ignore[misc]
 def infer(model: Module, dataloader: DataLoader, data_cnames: Sequence[str], model_cnames: Sequence[str],
-             samples_found: int) -> Iterator[Tuple[Array, Array]]:
+          samples_found: int) -> Iterator[Tuple[Array, Array]]:
     assert set(data_cnames).issuperset(set(model_cnames))
     model.eval()
-    print('==> Evaluating...')
+    print('==> Running inference...')
     start_time = timer()
 
     nan = float('NaN')  # Placeholder value
@@ -105,12 +104,10 @@ def infer(model: Module, dataloader: DataLoader, data_cnames: Sequence[str], mod
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 5:
-        raise ValueError('Expected 4 arguments, got {}'.format(len(sys.argv) - 1))
+    if len(sys.argv) != 4:
+        raise ValueError('Expected 3 arguments, got {}'.format(len(sys.argv) - 1))
 
-    checkpoint_path, data_cnames_str, sample_paths_file, output_file = sys.argv[1:]
-    data_cnames = data_cnames_str.split(',')
-    del data_cnames_str
+    checkpoint_path, sample_paths_file, output_file = sys.argv[1:]
 
     checkpoint = torch.load(checkpoint_path)
     print("==> Loaded checkpoint from '{}'".format(checkpoint_path))
@@ -121,35 +118,16 @@ if __name__ == '__main__':
     with open(sample_paths_file) as spf:
         sample_paths = [line.rstrip('\n') for line in spf]
 
-    try:
-        model_cnames = checkpoint['out_classes']
-    except KeyError:
-        model_cnames = data_cnames  # Model provides all classes
-        assert checkpoint['out_features'] == len(model_cnames)
-    else:
-        assert model_cnames
+    model_cnames = checkpoint['out_classes']
+    data_cnames = checkpoint['data_cnames']
 
     model = ModelLoader(checkpoint=checkpoint, tta_mode='mean').create_model().to(DEVICE)
     del checkpoint
 
-    if isinstance(model, CatModel):
-        # CatModel has built-in scaling and normalization
-        data_transform = transforms.Compose([
-            # Scale to a common size
-            transforms.Resize((
-                max(m.default_cfg['input_size'][-2] for m in model.models),
-                max(m.default_cfg['input_size'][-1] for m in model.models),
-            )),
-            transforms.ToTensor(),
-        ])
-    else:
-        # Use timm-style cfg to get correct normalization parameters
-        normalize = transforms.Normalize(model.default_cfg['mean'], model.default_cfg['std'])
-        data_transform = transforms.Compose([
-            transforms.Resize(model.default_cfg['input_size'][-2:]),  # Scaling for non-CatModel
-            transforms.ToTensor(),
-            normalize,
-        ])
+    data_transform = transforms.Compose([
+        MayResize(model.max_insize),
+        transforms.ToTensor(),
+    ])
 
     fd = os.open(output_file, os.O_RDWR | os.O_CREAT, 0o644)
     with open(fd, 'r+b') as predfile:
