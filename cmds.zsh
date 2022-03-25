@@ -4,7 +4,7 @@ source "${_script_dir}/.venv/bin/activate"
 model=rexnet_200
 dataset=my_dataset
 batch_size=32
-weight_decay=1e-2
+weight_decay=1e-4
 l2reg=1e-2
 
 _getbase() {
@@ -17,11 +17,7 @@ _getbase() {
 train() {
   (( $# < 4 )) && return 1
   local n=$1 epochs=$2 lr=$3; shift 3
-  ./cebnn_main.py --data-dir="data/${dataset}" --task=train --save="nets/${dataset}/${model}_${n}.torch" "${(@Q)${(z)$(_getbase)}}" --batch-size=${batch_size} --epochs=${epochs} --post-resample=none --wd=${weight_decay} --lr=${lr} --l2reg=${l2reg} --tta=mean "$@"
-}
-
-find_lr() {
-  ./cebnn_main.py --data-dir=data/${dataset} --task=find_lr --quick-findlr "${(@Q)${(z)$(_getbase)}}" --batch-size=${batch_size} --optimizer=sgdw --wd=${weight_decay} --l2reg=${l2reg} "$@"
+  ./cebnn_main.py --data-dir="data/${dataset}" --task=train --save="nets/${dataset}/${model}_${n}.torch" "${(@Q)${(z)$(_getbase)}}" --batch-size=${batch_size} --epochs=${epochs} --wd=${weight_decay} --lr=${lr} --l2reg=${l2reg} --tta=mean "$@"
 }
 
 find_aug() {
@@ -33,45 +29,39 @@ find_aug() {
 train_more() {
   (( $# < 3 )) && return 1
   local old_n=$1 n=$2 epochs=$3; shift 3
-  ./cebnn_main.py --data-dir="data/${dataset}" --task=train --load="nets/${dataset}/${model}_${old_n}.torch" --save="nets/${dataset}/${model}_${n}.torch" --epochs=${epochs} --l2reg=${l2reg} "$@"
-}
-
-train_xgb() {
-  (( ! $# )) && return 1
-  local n=$1; shift 1
-  ./cebnn_main.py --data-dir="data/${dataset}" --task=train_xgb --save="nets/${dataset}/xgb_${n}.torch" --batch-size=64 --cvfolds=5 --post-oversample=0 "$@"
+  ./cebnn_main.py --task=train --load="nets/${dataset}/${model}_${old_n}.torch" --save="nets/${dataset}/${model}_${n}.torch" --epochs=${epochs} --l2reg=${l2reg} "$@"
 }
 
 plot_roc() (
   set -euo pipefail
   (( ! $# )) && return 1
-  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --data-dir="data/${dataset}" --task=roc --fig-dir="nets/${dataset}/figs" --load="$cp"; done
+  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --task=roc --fig-dir="nets/${dataset}/figs" --load="$cp"; done
 )
 
 get_correct() (
   set -euo pipefail
   (( $# < 2 )) && return 1
-  thresh_opt_metric=$1; shift 1
-  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --data-dir="data/${dataset}" --task=get_correct --correct-dir="nets/${dataset}/correct${thresh_opt_metric}" --load="$cp"; done
+  thresh_opt_metric=$1; shift
+  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --task=get_correct --correct-dir="nets/${dataset}/correct${thresh_opt_metric}" --load="$cp"; done
 )
 
 get_correct_test() (
   set -euo pipefail
   (( $# < 2 )) && return 1
-  thresh_opt_metric=$1; shift 1
-  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --data-dir="data/${dataset}" --task=get_correct --correct-dir="nets/${dataset}/correct${thresh_opt_metric}_test" --load="$cp" --test-with-cpickle-thr="nets/${dataset}/correct${thresh_opt_metric}/${cp##*/}_correct.pkl"; done
+  thresh_opt_metric=$1; shift
+  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --task=get_correct --correct-dir="nets/${dataset}/correct${thresh_opt_metric}_test" --load="$cp" --test-with-cpickle-thr="nets/${dataset}/correct${thresh_opt_metric}/${cp##*/}_correct.pkl"; done
 )
 
 eval_test() (
   set -euo pipefail
   (( ! $# )) && return 1
-  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --data-dir="data/${dataset}" --task=eval_test --eval-dir="nets/${dataset}/eval" --load="$cp"; done
+  for cp in "$@"; do printf '%s\n' "$cp"; ./cebnn_main.py --task=eval_test --eval-dir="nets/${dataset}/eval" --load="$cp"; done
 )
 
 sorted_metric() (
   set -euo pipefail
   (( $# < 2 )) && return 1
-  metric=$1; shift 1
+  metric=$1; shift
   find "$@" -maxdepth 0 -xtype f -print0 | sed -z 's|^\./||' | {
     i=0
     while IFS= read -rd '' file; do
@@ -94,7 +84,7 @@ EOF
         printf '%s\n' "$file"
         mkdir -p -- "$(dirname -- "$mf")"
         trap 'command rm -f -- "$mf"' INT TERM EXIT
-        ./cebnn_main.py --data-dir=data/${dataset} --task=metrics --load="$file" 2>|stderr.log | command tee "$mf"
+        ./cebnn_main.py --task=metrics --load="$file" 2>|stderr.log | command tee "$mf"
         trap - INT TERM EXIT
       fi
       (( ++i ))
