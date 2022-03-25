@@ -16,6 +16,7 @@ from PIL import Image, ImageChops
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from cebnn_common import Module
 from dataset import LabeledDataset, LabeledSubset, TransformedDataset
@@ -161,7 +162,7 @@ class RotateRange(Operation):
 
 class RandomCrop(transforms.RandomCrop, Operation):
     def __init__(self, crop: float, pad: float) -> None:
-        transforms.RandomCrop.__init__(self, None)
+        transforms.RandomCrop.__init__(self, (None, None))
         self.crop = crop
         self.pad = pad
 
@@ -177,8 +178,12 @@ class RandomCrop(transforms.RandomCrop, Operation):
 
 
 class MayResize:
-    def __init__(self, interpolation: int = Image.BILINEAR) -> None:
-        self.size = None
+    def __init__(
+        self,
+        size: Optional[tuple[int, int]] = None,
+        interpolation: InterpolationMode = InterpolationMode.BILINEAR
+    ) -> None:
+        self.size = size
         self.interpolation = interpolation
 
     def __call__(self, img: Image) -> Image:
