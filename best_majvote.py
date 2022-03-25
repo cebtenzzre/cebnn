@@ -188,7 +188,8 @@ class AllOddCombinations:
         if max_len is None:
             max_len = len(seq) - k
         else:
-            assert min_len + k <= max_len + k <= len(seq)
+            assert min_len + k <= max_len + k + 1  # free zeros/ones -> minimum +1
+            assert max_len + k <= len(seq)
         self._seq = seq
         self._min_len = min_len + k
         self._max_len = max_len + k
@@ -234,6 +235,9 @@ class AllOddCombinations:
             for i in range(self._min_len, self._max_len + 1)
         )
         yield from (c for c in it if not (0 in c and 1 in c))
+        # Allow zeros and ones for free
+        it = itertools.combinations(self._seq, self._max_len + 1)
+        yield from (c for c in it if (0 in c) != (1 in c))
 
 
 def getscore(cpathi: int) -> Tuple[int, Tuple[float, ...]]:
@@ -315,14 +319,16 @@ def init_worker(y_true: SharedIntArray, y_preds: SharedIntArray, y_us: SharedFlo
 
 
 if __name__ == '__main__':
-    do_weights_str, k_str, maxlen_str, numlabels_str, *cpaths = sys.argv[1:]
-    do_weights, k, maxlen, numlabels = bool(int(do_weights_str)), int(k_str), int(maxlen_str), int(numlabels_str)
+    maxlen_str, k_str, do_weights_str, *cpaths = sys.argv[1:]
+    maxlen, k, do_weights, = int(maxlen_str), int(k_str), bool(int(do_weights_str))
     pickles: Dict[str, EvalPickle] = {cpath: load(cpath) for cpath in cpaths}
     del cpaths
     assert len(pickles) >= MIN_LEN
+    numlabels = next(iter(pickles.values()))['label_count']
     y_true_l = next(p['y_true'] for p in pickles.values() if not any(x is None for x in p['y_true']))
     assert all(
-        len(p['y_true']) == len(y_true_l)
+        p['label_count'] == numlabels
+        and len(p['y_true']) == len(y_true_l)
         and all((x is None or x == y) for x, y in zip_strict(p['y_true'], y_true_l))
         for p in pickles.values()
     )

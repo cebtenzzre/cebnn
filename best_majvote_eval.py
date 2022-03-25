@@ -17,8 +17,6 @@ from util import zip_strict, zipstar_strict
 if TYPE_CHECKING:
     from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
-MIN_LEN = 3
-
 
 def getscore_combo(y_true: IntArray, y_preds: Tuple[IntArray, ...], y_us: Tuple[FloatArray, ...], k: int) -> float:
     mpred = mode_uk(y_preds, y_us, k)
@@ -28,14 +26,13 @@ def getscore_combo(y_true: IntArray, y_preds: Tuple[IntArray, ...], y_us: Tuple[
 
 if __name__ == '__main__':
     cpaths: Sequence[str]
-    k_str, numlabels_str, lblidx_str, *cpaths = sys.argv[1:]
-    k, numlabels, lblidx = int(k_str), int(numlabels_str), int(lblidx_str)
+    k_str, lblidx_str, *cpaths = sys.argv[1:]
+    k, lblidx = int(k_str), int(lblidx_str)
     cpaths = tuple(cpaths)
-    if len(cpaths) < MIN_LEN:
-        raise ValueError('Expected at least {} cpaths, got {}'.format(MIN_LEN, len(cpaths)))
     if (len(cpaths) - k) % 2 == 0:
         raise ValueError('Expected odd number of cpaths, got {}'.format(len(cpaths)))
 
+    numlabels: Optional[int] = None
     y_true_l: Optional[List[Optional[bool]]] = None
     if TYPE_CHECKING:
         Pred = Union[str, IntArray]
@@ -49,6 +46,10 @@ if __name__ == '__main__':
             uncertainties_list.append(None)
             continue
         pkl = load(cpickle_path)
+        if numlabels is None:
+            numlabels = pkl['label_count']
+        else:
+            assert pkl['label_count'] == numlabels
         pkl_true, pkl_preds, pkl_uncertainties = pkl['y_true'], pkl['y_pred'], pkl['y_u']
         if y_true_l is None:
             y_true_l = pkl_true
@@ -103,10 +104,11 @@ if __name__ == '__main__':
     print('  MCC: {}'.format(score))
     print('  Uncertainty: {}'.format(lblu(combo)))
     print('  Paths: {}'.format(cpaths))
-    print('  Individual MCCs: {}'.format(tuple(map(lblscore, combo))))
-    print('  Individual uncertainties: {}'.format(tuple(lblu((cp,)) for cp in combo)))
-    print('  Correlations:')
-    for a, b in itertools.combinations(range(len(cpaths)), 2):
-        apred = y_preds[a]
-        bpred = y_preds[b]
-        print('    {} with {}: {}'.format(a, b, corr(apred, bpred)))
+    if len(combo) > 1:
+        print('  Individual MCCs: {}'.format(tuple(map(lblscore, combo))))
+        print('  Individual uncertainties: {}'.format(tuple(lblu((cp,)) for cp in combo)))
+        print('  Correlations:')
+        for a, b in itertools.combinations(range(len(cpaths)), 2):
+            apred = y_preds[a]
+            bpred = y_preds[b]
+            print('    {} with {}: {}'.format(a, b, corr(apred, bpred)))

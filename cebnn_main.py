@@ -672,7 +672,11 @@ class Metrics:
         del it1
 
         with open(path, 'wb') as pf:
-            pickle.dump({'thresh': self.thresholds, 'y_true': y_true, 'y_pred': y_pred, 'y_u': y_u}, pf)
+            data = {
+                'label_count': len(cfg.data_classes), 'thresh': self.thresholds,
+                'y_true': y_true, 'y_pred': y_pred, 'y_u': y_u,
+            }
+            pickle.dump(data, pf)
 
         if log:
             print('\n==> Correctness pickle saved to {!r}.'.format(path))
