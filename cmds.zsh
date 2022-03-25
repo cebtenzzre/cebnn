@@ -154,7 +154,7 @@ json.dump(pkl, sys.stdout, default=default)
 EOF
 }
 
-LINT_FILES=( algorithm.py best_majvote_eval.py best_majvote.py cpickledir_checksame.py datamunge.py dataset.py dedup_listing.py eval_print_majvote.py eval_print.py eval_print_sorted.py eval.py eval_stream.py cebnn_common.py cebnn_main.py losses.py merge_results.py scale.py subtract_listings.py tag_all.py util.py )
+LINT_FILES=( algorithm.py best_majvote_eval.py best_majvote.py cpickledir_checksame.py datamunge.py dataset.py dedup_listing.py infer_print_majvote.py infer_print.py infer_print_sorted.py infer.py cebnn_common.py cebnn_main.py losses.py merge_results.py scale.py subtract_listings.py tag_all.py util.py )
 
 _lint() {
   # Make sure we can import the main file

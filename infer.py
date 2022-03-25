@@ -55,7 +55,7 @@ class ImageDataset(Dataset):
 
 
 @torch.no_grad()  # type: ignore[misc]
-def evaluate(model: Module, dataloader: DataLoader, data_cnames: Sequence[str], model_cnames: Sequence[str],
+def infer(model: Module, dataloader: DataLoader, data_cnames: Sequence[str], model_cnames: Sequence[str],
              samples_found: int) -> Iterator[Tuple[Array, Array]]:
     assert set(data_cnames).issuperset(set(model_cnames))
     model.eval()
@@ -188,5 +188,5 @@ if __name__ == '__main__':
             pickle.dump({'class_names': model_cnames, 'sample_paths': sample_paths}, predfile)
 
         # Incremental appends
-        for preds, uncertainties in evaluate(model, dataloader, data_cnames, model_cnames, samples_found):
+        for preds, uncertainties in infer(model, dataloader, data_cnames, model_cnames, samples_found):
             pickle.dump({'preds': preds, 'uncertainties': uncertainties}, predfile)
