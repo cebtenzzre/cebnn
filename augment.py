@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from cebnn_common import Module
-from dataset import LabeledDataset, LabeledSubset
+from dataset import LabeledDataset, LabeledSubset, TransformedDataset
 
 if TYPE_CHECKING:
     from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Union
@@ -234,12 +234,12 @@ def make_data_transform(distort: Optional[Tuple[float, int, float]], skew: Optio
     return transforms.Compose(ops)
 
 
-def find_best_augment_params(bal_train_dataset: LabeledDataset, dataloaders: Dict[str, DataLoader],
+def find_best_augment_params(train_dataset: LabeledDataset, opt_dataset_tformed: LabeledDataset,
                              optimizer: Optimizer, model: Module, device: torch.device, criterion: Module,
                              make_dataloader: Callable[..., DataLoader]) -> Dict[str, Any]:
     max_evals = 200
     # Cycle the train dataset a few times to simulate multiple epochs
-    find_aug_train_ds = LabeledSubset(bal_train_dataset, list(range(len(bal_train_dataset))) * 3)
+    find_aug_train_ds = LabeledSubset(train_dataset, list(range(len(train_dataset))) * 3)
 
     def objective(args: Dict[str, Any]) -> Dict[str, Any]:
         train_transform = make_data_transform(
@@ -262,7 +262,7 @@ def find_best_augment_params(bal_train_dataset: LabeledDataset, dataloaders: Dic
                 round(100 - args['jpeg_quality_maxf'] * (100 - args['jpeg_quality_min'])),
             ),
         )
-        dataloaders['train'] = make_dataloader(find_aug_train_ds, train_transform)
+        train_iter = make_dataloader(TransformedDataset(find_aug_train_ds, train_transform))
 
         # Save the model and optimizer
         model_state_dict = copy.deepcopy(model.state_dict())
@@ -270,7 +270,7 @@ def find_best_augment_params(bal_train_dataset: LabeledDataset, dataloaders: Dic
 
         # Train
         model.train()
-        for inputs, labels in dataloaders['train']:
+        for inputs, labels in train_iter:
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             for param in model.parameters():
@@ -281,12 +281,14 @@ def find_best_augment_params(bal_train_dataset: LabeledDataset, dataloaders: Dic
             # Backward pass
             loss.backward()
             optimizer.step()
+        del train_iter
 
         # Evaluate
+        opt_iter = make_dataloader(opt_dataset_tformed)
         model.eval()
         running_loss = 0.
         with torch.no_grad():
-            for inputs, labels in dataloaders['opt']:
+            for inputs, labels in opt_iter:
                 inputs = inputs.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 outputs = model(inputs)
@@ -296,7 +298,7 @@ def find_best_augment_params(bal_train_dataset: LabeledDataset, dataloaders: Dic
         model.load_state_dict(model_state_dict)
         optimizer.load_state_dict(optimizer_state_dict)
 
-        return {'loss': running_loss / len(dataloaders['opt']), 'status': STATUS_OK}
+        return {'loss': running_loss / len(opt_iter), 'status': STATUS_OK}
 
     space = {
         'distort': hp.choice('distort', [

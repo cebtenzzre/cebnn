@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import operator
 import os
 import re
 from abc import ABCMeta, abstractmethod
+from functools import reduce
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -23,15 +25,12 @@ if TYPE_CHECKING:
     from util import Array
     StrPath = Union[str, os.PathLike[str]]
 
-    # See https://github.com/google/pytype/issues/1151
-    class LSBase(Subset[Element]):
-        def __len__(self) -> int:
-            return 0  # NB: fake stub!
-else:
-    LSBase = Subset[Element]
-
 
 class LabeledDataset(Dataset[Element], metaclass=ABCMeta):
+    @abstractmethod
+    def __len__(self) -> int:
+        raise TypeError
+
     @property
     @abstractmethod
     def labelset(self) -> Sequence[Set[str]]:
@@ -46,10 +45,6 @@ class LabeledDataset(Dataset[Element], metaclass=ABCMeta):
     @abstractmethod
     def groups(self) -> Array:
         raise NotImplementedError
-
-    @abstractmethod
-    def __len__(self) -> int:
-        raise TypeError
 
 
 class MultiLabelCSVDataset(LabeledDataset):
@@ -121,7 +116,9 @@ class TransformedDataset(LabeledDataset):
     def groups(self) -> Array: return self.dataset.groups
 
 
-class LabeledSubset(LSBase, LabeledDataset):
+# Cannot use base directly, see https://github.com/google/pytype/issues/1151
+@LabeledDataset.register
+class LabeledSubset(Subset[Element]):
     dataset: LabeledDataset
 
     @property
@@ -136,3 +133,35 @@ class LabeledSubset(LSBase, LabeledDataset):
     @property
     def groups(self) -> Array:
         return self.dataset.groups[list(self.indices)]
+
+
+class CatDataset(LabeledDataset):
+    def __init__(self, *datasets: LabeledDataset) -> None:
+        self.datasets = datasets
+
+    def __getitem__(self, index: int) -> Element:
+        it = iter(self.datasets)
+        while True:
+            try:
+                ds = next(it)
+            except StopIteration:
+                raise IndexError('CatDataset index out of range') from None
+            if index < (l := len(ds)):
+                break
+            index -= l
+        return ds
+
+    def __len__(self) -> int:
+        return sum(len(ds) for ds in self.datasets)
+
+    @property
+    def labelset(self) -> Sequence[Set[str]]:
+        return reduce(operator.add, (list(ds.labelset) for ds in self.datasets))
+
+    @property
+    def targets(self) -> Array:
+        return np.concatenate([ds.targets for ds in self.datasets])
+
+    @property
+    def groups(self) -> Array:
+        return np.concatenate([ds.groups for ds in self.datasets])

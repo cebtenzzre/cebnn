@@ -38,7 +38,8 @@ from pytorch_warmup import UntunedLinearWarmup
 from scipy.optimize import basinhopping
 from sklearn.metrics import matthews_corrcoef, roc_auc_score, roc_curve
 from skorch import NeuralNetClassifier
-from skorch.callbacks import Callback, ProgressBar
+from skorch.exceptions import SkorchWarning
+from skorch.callbacks import Callback, EpochScoring, PrintLog, ProgressBar
 from skorch.dataset import get_len, unpack_data
 from skorch.utils import TeeGenerator, to_tensor
 from tap import Tap
@@ -55,18 +56,16 @@ from adamwr.adamw import AdamW
 from adamwr.cyclic_scheduler import CyclicLRWithRestarts
 from algorithm import fbeta_like_geo_youden, multilabel_confusion_matrix
 from augment import MayResize, find_best_augment_params, make_data_transform
-from cebnn_common import (CatModel, ModelLoader, model_supports_resnet_d, parse_sublayer_ratio, pos_proba,
-                          pred_uncertainty)
+from cebnn_common import ModelLoader, model_supports_resnet_d, parse_sublayer_ratio, pos_proba, pred_uncertainty
 from datamunge import ImbalancedDatasetSampler
-from dataset import LabeledDataset, LabeledSubset, MultiLabelCSVDataset, TransformedDataset
+from dataset import CatDataset, LabeledDataset, LabeledSubset, MultiLabelCSVDataset, TransformedDataset
 from losses import EDL_Digamma_Loss, EDL_Log_Loss, EDL_MSE_Loss
 from sgdw import SGDW
 from util import zip_strict
 
 if TYPE_CHECKING:
-    from typing import Callable, Dict, Iterable, NoReturn, Sequence, Set, Type, Union
+    from typing import Callable, Dict, Iterable, Iterator, NoReturn, Sequence, Set, Type, Union
 
-    from PIL import Image
     from sklearn.base import BaseEstimator
     from torch.optim.lr_scheduler import _LRScheduler
     from torch.utils.data.dataset import Dataset
@@ -95,10 +94,8 @@ DEFAULT_NUM_WORKERS = 4
 UNTYPED_NONE: Any = None
 
 cfg: 'Config' = UNTYPED_NONE
-dataloaders: Dict[str, Any] = {}
-data_transforms: Dict[str, transforms.Compose] = {}
+transformed_datasets: Dict[str, LabeledDataset] = {}
 device: torch.device = UNTYPED_NONE
-model: Module = UNTYPED_NONE
 options: 'MainArgParser' = UNTYPED_NONE
 
 
@@ -267,18 +264,18 @@ def prestep_clipping_optimizer(base_type: Type[Optimizer]) -> Type[Any]:
     return PrestepClippingOptimizer
 
 
-def print_predictions(model: Module, criterion: Module, checkpoint: Dict[str, Any]) -> None:
+def print_predictions(net: NeuralNetClassifier, checkpoint: Dict[str, Any]) -> None:
     def format_labels(labels: Iterable[str]) -> str:
         labels = frozenset(labels)
         def lify(l: str) -> str: return '{},'.format(l) if l in labels else ' ' * (len(l) + 1)
-        return ''.join(map(lify, cfg.class_names))[:-1]
+        return ''.join(map(lify, cfg.model_classes))[:-1]
 
     metrics = Metrics()
-    metrics.f_score_eval(model, criterion, checkpoint, log=False)
+    metrics.f_score_eval(net, checkpoint, log=False)
 
     for sample_targets, sample_preds in zip_strict(metrics.true_labels, metrics.predictions):
-        in_labels = [cn for tl, cn in zip_strict(sample_targets, cfg.class_names) if tl > .99]
-        out_labels = [cn for pr, cn, th in zip_strict(sample_preds, cfg.class_names, metrics.thresholds) if pr > th]
+        in_labels = [cn for tl, cn in zip_strict(sample_targets, cfg.model_classes) if tl > .99]
+        out_labels = [cn for pr, cn, th in zip_strict(sample_preds, cfg.model_classes, metrics.thresholds) if pr > th]
 
         if not in_labels and not out_labels:
             continue  # Not interesting
@@ -327,7 +324,7 @@ def geoy(true_labels: Array, predictions: Array, thresholds: Array,
 
 # Scipy tries to minimize the function, so we must get its inverse
 def geoy_neg(true: Array, pred: Array, i: Optional[int] = None) -> Callable[[Array], float]:
-    average = 'macro' if i is None and len(cfg.class_names) > 1 else 'binary'
+    average = 'macro' if i is None and len(cfg.model_classes) > 1 else 'binary'
     return lambda th: - geoy(true, pred, th, average=average, i=i)
 
 
@@ -341,10 +338,10 @@ def minimizer_bounds(**kwargs: Any) -> bool:
 def minimize_global(true: Array, pred: Array, minimizer_kwargs: Dict[str, Any],
                     bounds: Callable[..., bool], st_point: float) -> List[Tuple[float, float]]:
     # We combine SLSQP with Basinhopping for stochastic search with random steps
-    thr_0 = np.array([st_point for _ in cfg.class_names])
+    thr_0 = np.array([st_point for _ in cfg.model_classes])
     opt_output = basinhopping(geoy_neg(true, pred), thr_0, stepsize=.1, niter=150 if options.optmode == 1 else 20,
                               minimizer_kwargs=minimizer_kwargs, accept_test=bounds, seed=88)
-    if len(cfg.class_names) > 1:
+    if len(cfg.model_classes) > 1:
         scores: List[float] = geoy(true, pred, opt_output.x, average=None)
     else:
         scores = [-opt_output.fun]
@@ -373,7 +370,7 @@ def refine(true: Array, pred: Array, minimizer_kwargs: Dict[str, Any],
 # From https://github.com/mratsim/Amazon-Forest-Computer-Vision/blob/master/src/p2_validation.py
 def best_f_score(true_labels: Array, predictions: Array, log: bool = False) -> List[Tuple[float, float]]:
     # Initialization of best threshold search
-    constraints = [(0., 1.) for _ in cfg.class_names]
+    constraints = [(0., 1.) for _ in cfg.model_classes]
 
     # Search using SLSQP, the epsilon step must be big otherwise there is no gradient
     minimizer_kwargs = {
@@ -390,7 +387,7 @@ def best_f_score(true_labels: Array, predictions: Array, log: bool = False) -> L
     st_points = [.00736893 * math.e ** (.421019 * x) for x in range(11)]
     st_points.extend(1. - p for p in reversed(st_points[:-1]))
 
-    max_threads = max(len(st_points), len(cfg.class_names))
+    max_threads = max(len(st_points), len(cfg.model_classes))
     cpus = os.cpu_count()
     if cpus is not None and max_threads > cpus:
         max_threads = cpus
@@ -413,9 +410,9 @@ def best_f_score(true_labels: Array, predictions: Array, log: bool = False) -> L
 
         minimizer_kwargs['bounds'] = [constraints[0]]
 
-        assert len(best_scores) == len(cfg.class_names)
+        assert len(best_scores) == len(cfg.model_classes)
 
-        if len(cfg.class_names) > 1:
+        if len(cfg.model_classes) > 1:
             new_scores = p.starmap(
                 refine,
                 ((true_labels, predictions, minimizer_kwargs, minimizer_bounds, best_score[0], i)
@@ -426,7 +423,7 @@ def best_f_score(true_labels: Array, predictions: Array, log: bool = False) -> L
     if log:
         print(' found in {:.2f}s'.format(end_time - start_time))
 
-    if len(cfg.class_names) > 1:
+    if len(cfg.model_classes) > 1:
         for i, (best_score, new_score) in enumerate(zip_strict(best_scores, new_scores)):
             if new_score[1] > best_score[1]:
                 if log:
@@ -451,7 +448,7 @@ def plot_roc(true_labels: Array, predictions: Array, fig_dir: StrPath) -> None:
 
     plt.figure()
     plt.plot([0, 1], [0, 1], 'k--')
-    for roc, name in zip_strict(rocs, cfg.class_names):
+    for roc, name in zip_strict(rocs, cfg.model_classes):
         plt.plot(*roc, label=name)
     plt.xlabel('False positive rate')
     plt.ylabel('True positive rate')
@@ -460,18 +457,24 @@ def plot_roc(true_labels: Array, predictions: Array, fig_dir: StrPath) -> None:
     plt.savefig(os.path.join(fig_dir, '{}_roc.svg'.format(bname)), bbox_inches='tight')
 
 
-# From https://github.com/mratsim/Amazon-Forest-Computer-Vision/blob/master/src/p_metrics.py
-def evaluate(model: Module, loss_func: Module, checkpoint: Dict[str, Any], log: bool = True) \
-        -> Tuple[Array, Array, Optional[Array], Array, Optional[Array]]:
-    model.eval()
+def make_dataloader(dataset: LabeledDataset) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+    )
 
+
+def evaluate(net: NeuralNetClassifier, checkpoint: Dict[str, Any], log: bool = True) \
+        -> Tuple[Array, Array, Optional[Array], Array, Optional[Array]]:
     # Use precomputed data if available
     if options.from_cpickle is not None:
         with open(options.from_cpickle, 'rb') as pf:
             pkl = pickle.load(pf)
             def load(what: str) -> Array:
                 return (np.fromiter((y for y in pkl[what] if y is not None), dtype=np.float32)
-                        .reshape(-1, len(cfg.class_names)))
+                        .reshape(-1, len(cfg.model_classes)))
             return load('y_pred'), load('y_u'), None, load('y_true'), pkl['thresh']
     elif (
         options.test_with_cpickle_thr is None
@@ -484,43 +487,36 @@ def evaluate(model: Module, loss_func: Module, checkpoint: Dict[str, Any], log: 
         except KeyError:
             pass
 
-    num_epochs: int = checkpoint['epoch'] + 1
-
-    total_loss = 0.
-    predictions = []
-    uncertainties = []
-    total_evidence = []
-    true_labels = []
-
     start_time = None
     if log:
         print('==> Evaluating...')
         start_time = timer()
 
-    dataloader = dataloaders['opt' if options.test_with_cpickle_thr is None else 'test']
-    with torch.no_grad():
-        for inputs, target in tqdm(dataloader):
-            true_labels.append(target.cpu().numpy())
-
-            inputs = inputs.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-
-            alpha = model(inputs)
-            predictions.append(pos_proba(alpha).cpu().numpy())
-            uncertainties.append(pred_uncertainty(alpha).cpu().numpy())
-            total_evidence.append(torch.sum(alpha - 1, dim=-1).cpu().numpy())
-
-            total_loss += loss_func(alpha, target, num_epochs).item() * inputs.size(0)
-
-    avg_loss = total_loss / len(dataloader)
+    dataset = transformed_datasets['opt' if options.test_with_cpickle_thr is None else 'test']
+    preds, us, tot_ev, targets, avg_loss = eval_inner(net, dataset, checkpoint['epoch'] + 1, progress=True)
 
     if start_time is not None:
         end_time = timer()
         print('==> Done in {:.2f}s.'.format(end_time - start_time))
         print('==> Avg. loss: {:.4f}'.format(avg_loss))
 
-    return (np.concatenate(predictions), np.concatenate(uncertainties), np.concatenate(total_evidence),
-            np.concatenate(true_labels), None)
+    return preds, us, tot_ev, targets, None
+
+
+def eval_inner(net: NeuralNetClassifier, dataset: LabeledDataset, epoch: int, progress: bool = False,
+               leave: bool = True) -> tuple[Array, Array, Array, Array, float]:
+    it: Iterator[Tensor] = net.forward_iter(dataset)
+    it = tqdm(it, total=math.ceil(len(dataset) / cfg.batch_size), leave=leave) if progress else it
+
+    alpha = torch.cat(list(it))
+    predictions = pos_proba(alpha).cpu().numpy()
+    uncertainties = pred_uncertainty(alpha).cpu().numpy()
+    total_evidence = torch.sum(alpha - 1, dim=-1).cpu().numpy()
+
+    y_true = torch.as_tensor(dataset.targets, device=alpha.device)
+    avg_loss = net.criterion_(alpha, y_true, epoch)
+
+    return predictions, uncertainties, total_evidence, dataset.targets, avg_loss
 
 
 class Metrics:
@@ -530,18 +526,19 @@ class Metrics:
     true_labels: Array
     thresholds: List[float]
 
-    def f_score_eval(self, model: Module, loss_func: Module, checkpoint: Dict[str, Any], log: bool = True) -> None:
+    def f_score_eval(self, net: NeuralNetClassifier, checkpoint: Dict[str, Any], log: bool = True) \
+            -> None:
         self.predictions, self.uncertainties, self.total_evidence, self.true_labels, cpickle_thresh = \
-            evaluate(model, loss_func, checkpoint, log)
+            evaluate(net, checkpoint, log)
 
         if options.threshold_override is not None:
             if len(options.threshold_override) == 1:
-                self.thresholds = [options.threshold_override[0] for _ in cfg.class_names]
+                self.thresholds = [options.threshold_override[0] for _ in cfg.model_classes]
             else:
                 self.thresholds = list(options.threshold_override)
             best_f_scores = [(th, 0.) for th in self.thresholds]
         elif options.from_cpickle is not None:
-            self.thresholds = [.5 for _ in cfg.class_names]
+            self.thresholds = [.5 for _ in cfg.model_classes]
             best_f_scores = [(th, 0.) for th in self.thresholds]
         elif options.test_with_cpickle_thr is not None:
             with open(options.test_with_cpickle_thr, 'rb') as pf:
@@ -554,7 +551,7 @@ class Metrics:
 
         if log:
             def format_float(vals: Iterable[float]) -> Dict[str, str]:
-                return dict(zip_strict(cfg.class_names, map('{:.4f}'.format, vals)))
+                return dict(zip_strict(cfg.model_classes, map('{:.4f}'.format, vals)))
             def format_scores(idx: int) -> Dict[str, str]:
                 return format_float(tup[idx] for tup in best_f_scores)
             thresholds, f_scores = format_scores(0), format_scores(1)
@@ -565,7 +562,7 @@ class Metrics:
             print('==> Optimal threshold for each label:\n  {}'.format(thresholds))
             print('==> F-Score for each label:\n  {}'.format(f_scores))
 
-            def zeros() -> List[int]: return [0 for _ in cfg.class_names]
+            def zeros() -> List[int]: return [0 for _ in cfg.model_classes]
             true_positives, false_negatives, false_positives, true_negatives = \
                 zeros(), zeros(), zeros(), zeros()
 
@@ -584,7 +581,7 @@ class Metrics:
                     cat[j] += 1
 
             def fmt(cat: Iterable[int]) -> Dict[str, str]:
-                return dict(zip_strict(cfg.class_names, ('{:3d}'.format(l) for l in cat)))
+                return dict(zip_strict(cfg.model_classes, ('{:3d}'.format(l) for l in cat)))
             print('==> True positives for each label:\n  {}'.format(fmt(true_positives)))
             print('==> False negatives for each label:\n  {}'.format(fmt(false_negatives)))
             print('==> False positives for each label:\n  {}'.format(fmt(false_positives)))
@@ -602,14 +599,14 @@ class Metrics:
                 print('==> Mean success evidence for each label:\n  {}'.format(format_float(mean_evidence_succ)))
                 print('==> Mean failure evidence for each label:\n  {}'.format(format_float(mean_evidence_fail)))
 
-    def metrics_eval(self, model: Module, loss_func: Module, checkpoint: Dict[str, Any]) -> None:
-        self.f_score_eval(model, loss_func, checkpoint)
+    def metrics_eval(self, net: NeuralNetClassifier, checkpoint: Dict[str, Any]) -> None:
+        self.f_score_eval(net, checkpoint)
 
         # [(label1_true..., label1_pred...), (label2_true..., label2_pred...), ...]
         pred_data = list(zip_strict(self.true_labels.T, self.predictions.T))
 
         def fmt(g: Iterable[float]) -> Dict[str, str]:
-            return dict(zip_strict(cfg.class_names, ('{:.4f}'.format(fs) for fs in g)))
+            return dict(zip_strict(cfg.model_classes, ('{:.4f}'.format(fs) for fs in g)))
 
         mccs = (matthews_corrcoef(truth, [p > th for p in pred])
                 for (truth, pred), th in zip_strict(pred_data, self.thresholds))
@@ -620,7 +617,7 @@ class Metrics:
             roc_aucs = (roc_auc_score(truth, pred) for truth, pred in pred_data)
             print('==> ROC AUC for each label:\n  {}'.format(fmt(roc_aucs)))
 
-    def test_eval(self, model: Module, loss_func: Module, checkpoint: Dict[str, Any], log: bool = True) -> None:
+    def test_eval(self, net: NeuralNetClassifier, checkpoint: Dict[str, Any], log: bool = True) -> None:
         assert options.eval_dir is not None
         assert options.load is not None and len(options.load) == 1
         path = os.path.join(options.eval_dir, os.path.basename(*options.load) + '_eval.pkl')
@@ -628,11 +625,11 @@ class Metrics:
             return  # Don't clobber it
 
         self.predictions, self.uncertainties, self.total_evidence, self.true_labels, _ = \
-            evaluate(model, loss_func, checkpoint, log)
+            evaluate(net, checkpoint, log)
 
         teval: Dict[str, Tuple[Any, Any]] = defaultdict(lambda: ([], []))
         for sample_targets, sample_preds in zip_strict(self.true_labels, self.predictions):
-            for label_name, label_true, label_pred in zip_strict(cfg.class_names, sample_targets, sample_preds):
+            for label_name, label_true, label_pred in zip_strict(cfg.model_classes, sample_targets, sample_preds):
                 pred, true = teval[label_name]
                 pred.append(label_pred)
                 true.append(label_true)
@@ -643,22 +640,16 @@ class Metrics:
             pickle.dump(teval, pf)
 
         if log:
-            print("\n==> Evaluation results saved to '{}'.".format(path))
+            print('\n==> Evaluation results saved to {!r}.'.format(path))
 
-    def correct_eval(self, model: Module, loss_func: Module, checkpoint: Dict[str, Any],
-                     data_cnames: Optional[Sequence[str]] = None, log: bool = True) -> None:
-        if data_cnames is None:
-            data_cnames = cfg.class_names
-        else:
-            assert set(data_cnames).issuperset(set(cfg.class_names))
-
+    def correct_eval(self, net: NeuralNetClassifier, checkpoint: Dict[str, Any], log: bool = True) -> None:
         assert options.correct_dir is not None
         assert options.load is not None and len(options.load) == 1
         path = os.path.join(options.correct_dir, os.path.basename(*options.load) + '_correct.pkl')
         if os.path.exists(path):
             return  # Don't clobber it
 
-        self.f_score_eval(model, loss_func, checkpoint)
+        self.f_score_eval(net, checkpoint)
 
         y_true: List[Optional[bool]] = []
         y_pred: List[Optional[bool]] = []
@@ -668,32 +659,32 @@ class Metrics:
             lbl_to_true: Dict[str, bool] = {}
             lbl_to_pred: Dict[str, bool] = {}
             lbl_to_uncertainty: Dict[str, float] = {}
-            it2 = enumerate(zip_strict(cfg.class_names, sample_targets, sample_preds, sample_uncertainties))
+            it2 = enumerate(zip_strict(cfg.model_classes, sample_targets, sample_preds, sample_uncertainties))
             for j, (lblname, lbltrue, lblpred, lblu) in it2:
                 lbl_to_true[lblname] = lbltrue > .99
                 lbl_to_pred[lblname] = lblpred > self.thresholds[j]
                 lbl_to_uncertainty[lblname] = lblu
             del it2
             # Substitute with None if label not predicted
-            y_true.extend(map(lbl_to_true.get, data_cnames))
-            y_pred.extend(map(lbl_to_pred.get, data_cnames))
-            y_u.extend(map(lbl_to_uncertainty.get, data_cnames))
+            y_true.extend(map(lbl_to_true.get, cfg.data_classes))
+            y_pred.extend(map(lbl_to_pred.get, cfg.data_classes))
+            y_u.extend(map(lbl_to_uncertainty.get, cfg.data_classes))
         del it1
 
         with open(path, 'wb') as pf:
             pickle.dump({'thresh': self.thresholds, 'y_true': y_true, 'y_pred': y_pred, 'y_u': y_u}, pf)
 
         if log:
-            print("\n==> Correctness pickle saved to '{}'.".format(path))
+            print('\n==> Correctness pickle saved to {!r}.'.format(path))
 
 
-def roc_eval(model: Module, loss_func: Module, fig_dir: StrPath, checkpoint: Dict[str, Any], log: bool = True) -> None:
-    predictions, _, _, true_labels, _ = evaluate(model, loss_func, checkpoint, log)
+def roc_eval(net: NeuralNetClassifier, fig_dir: StrPath, checkpoint: Dict[str, Any], log: bool = True) -> None:
+    predictions, _, _, true_labels, _ = evaluate(net, checkpoint, log)
 
     plot_roc(true_labels, predictions, fig_dir)
 
     if log:
-        print("\n==> ROC curve plots saved to '{}'.".format(os.fspath(fig_dir)))
+        print('\n==> ROC curve plots saved to {!r}.'.format(os.fspath(fig_dir)))
 
 
 def save_random_state() -> Dict[str, Any]:
@@ -707,7 +698,7 @@ def save_random_state() -> Dict[str, Any]:
 
 class TrainerCallback(Callback):
     def __init__(
-        self, scheduler: _LRScheduler, warmup_scheduler: Optional[UntunedLinearWarmup], pbar: ProgressBar
+        self, scheduler: Optional[_LRScheduler], warmup_scheduler: Optional[UntunedLinearWarmup], pbar: ProgressBar,
     ) -> None:
         self.scheduler = scheduler
         self.warmup_scheduler = warmup_scheduler
@@ -715,15 +706,13 @@ class TrainerCallback(Callback):
         self.best_loss = np.inf
         self.best_state: Optional[io.BytesIO] = None
         self.start_time: Optional[float] = None
-        self.cur_epoch: Optional[int] = None
 
     def on_epoch_begin(self, net: NeuralNetClassifier, dataset_train: Optional[AnyDataset] = None,  # noqa: U100
                        dataset_valid: Optional[AnyDataset] = None, **kwargs: Any) -> None:
-        epoch: int = kwargs['epoch']
-        self.cur_epoch = epoch
+        net.history[-1]['epoch'] -= 1  # offset for pre-epoch
 
         self.pbar.batches_per_epoch = (
-            math.ceil(get_len(dataset_train) / cfg.batch_size) +
+            (0 if dataset_train is None else math.ceil(get_len(dataset_train) / cfg.batch_size)) +
             math.ceil(get_len(dataset_valid) / cfg.batch_size)
         )
 
@@ -731,14 +720,14 @@ class TrainerCallback(Callback):
             assert self.warmup_scheduler is None
             self.scheduler.step()
 
-    def on_batch_begin(self, net: NeuralNetClassifier, *args: object, **kwargs: object) -> None:  # noqa: U100
-        if self.warmup_scheduler is not None:
-            assert self.cur_epoch is not None
+    def on_batch_begin(self, net: NeuralNetClassifier, batch: object = None,  # noqa: U100
+                       training: Optional[bool] = None, **kwargs: object) -> None:  # noqa: U100
+        if training and self.warmup_scheduler is not None:
             with warnings.catch_warnings():
                 # Deprecated step() usage is recommended by the warmup scheduler
                 warnings.filterwarnings('ignore', '.*call them in the opposite order.*', UserWarning)
                 warnings.filterwarnings('ignore', 'The epoch parameter.*', UserWarning)
-                self.scheduler.step(self.cur_epoch)
+                self.scheduler.step(net.history[-1]['epoch'] - 1)
             self.warmup_scheduler.dampen()
 
     def on_batch_end(self, net: NeuralNetClassifier, batch: object = None,  # noqa: U100
@@ -748,12 +737,20 @@ class TrainerCallback(Callback):
             assert self.warmup_scheduler is None
             self.scheduler.batch_step()
 
-    def on_epoch_end(self, net: NeuralNetClassifier, *args: object, **kwargs: object) -> None:  # noqa: U100
-        if isinstance(self.scheduler, (StepLR, CosineAnnealingLR)) and self.warmup_scheduler is None:
+    def on_epoch_end(self, net: NeuralNetClassifier, dataset_train: object = None, *args: object,  # noqa: U100
+                     **kwargs: object) -> None:  # noqa: U100
+        if (
+            dataset_train is not None
+            and isinstance(self.scheduler, (StepLR, CosineAnnealingLR))
+            and self.warmup_scheduler is None
+        ):
             self.scheduler.step()
 
+        if dataset_train is None:
+            net.history[-1]['train_loss'] = None
+
         # Save the trainer state if the model is still making progress.
-        if net.history[-1, 'train_loss_best'] or net.history[-1, 'valid_loss_best']:
+        if dataset_train is None or net.history[-1, 'train_loss_best'] or net.history[-1, 'valid_loss_best']:
             self.best_loss = net.history[-1, 'valid_loss']
             self._save_state_dict(net)
 
@@ -828,27 +825,32 @@ class MyNeuralNetClassifier(NeuralNetClassifier):
         def step_fn() -> Tensor:
             step = self.train_step_single(batch, **fit_params)
             step_accumulator.store_step(step)
-            self.notify('on_grad_computed', named_parameters=TeeGenerator(self.module_.named_parameters()), batch=batch)
+            self.notify(
+                'on_grad_computed',
+                named_parameters=TeeGenerator(self.module_.named_parameters()),
+                batch=batch,
+            )
             return step['loss']
         self.optimizer_.step(step_fn)
         for param in self.module_.parameters():
             param.grad = None
         return step_accumulator.get_step()
 
-    # Passes the epoch to the callbacks and run_single_epoch
+    # Passes the accurate epoch to run_single_epoch so loss can use it
+    # Gets validation data via ds_valid
     def fit_loop(self, X: AnyDataset, y: Optional[Array] = None, epochs: Optional[int] = None, **fit_params: Any) \
             -> NeuralNetClassifier:
         self.check_data(X, y)
         epochs = epochs if epochs is not None else self.max_epochs
 
-        dataset_train, dataset_valid = self.get_split_datasets(X, y, **fit_params)
+        dataset_train = self.get_dataset(X, y)
+        dataset_valid = self.get_dataset(fit_params.pop('valid'))
         on_epoch_kwargs = {
             'dataset_train': dataset_train,
             'dataset_valid': dataset_valid,
         }
 
         for epoch in range(self.initial_epoch, self.initial_epoch + epochs):
-            on_epoch_kwargs['epoch'] = epoch
             fit_params['epoch'] = epoch
 
             self.notify('on_epoch_begin', **on_epoch_kwargs)
@@ -870,6 +872,17 @@ class MyNeuralNetClassifier(NeuralNetClassifier):
     def _get_loss(self, y_pred: Tensor, y_true: Tensor, epoch: int) -> Tensor:
         y_true = to_tensor(y_true, device=self.device)
         return self.criterion_(y_pred, y_true, epoch)
+
+
+class MyPrintLog(PrintLog):
+    KEY_ORDER = ('epoch', 'train_loss', 'valid_loss', 'valid_mcc', 'valid_acc', 'dur')
+
+    # User-defined key order
+    def _sorted_keys(self, keys: object) -> list[str]:
+        skeys = super()._sorted_keys(keys)
+        if set(skeys) != set(self.KEY_ORDER):
+            raise ValueError(f'Expected keys: {self.KEY_ORDER}\nGot keys: {skeys}')
+        return list(self.KEY_ORDER)
 
 
 class MyAdaBelief(AdaBelief):
@@ -919,7 +932,7 @@ class ResampleArgs:
             return cls(None, {})
         m, s = s[0], s[1:]
         if m not in '+-':
-            raise ValueError("Resample: Expected mode of + or -, got '{}'".format(m))
+            raise ValueError("Resample: Expected mode of '+' or '-', got {!r}".format(m))
         alg = 'ML-ROS' if m == '+' else 'ML-RUS'
         kwargs: Dict[str, Any] = {}
         if not s:
@@ -935,7 +948,7 @@ class ResampleArgs:
                 kwargs['imbalance_target'] = float(arg)
             if arg := next(it):
                 if arg not in ('pos', 'all'):
-                    raise ValueError("Resample: Expected imbalance mode of 'pos' or 'all', got '{}'".format(arg))
+                    raise ValueError("Resample: Expected imbalance mode of 'pos' or 'all', got {!r}".format(arg))
                 kwargs['mode'] = arg
         except StopIteration:
             pass
@@ -993,7 +1006,7 @@ class ResampledLabeledSubset(LabeledDataset):
     def _init(self) -> None:
         if cfg.resample.algorithm is not None:
             self.indices = tuple(ImbalancedDatasetSampler(
-                self.dataset.labelset, ds_labels=cfg.class_names,
+                self.dataset.labelset, ds_labels=cfg.model_classes,
                 algorithm=cfg.resample.algorithm,
                 alg_kwargs=cfg.resample.kwargs,
                 rand=self.rand,
@@ -1001,25 +1014,19 @@ class ResampledLabeledSubset(LabeledDataset):
 
 
 class Config:
-    def __init__(
-        self,
-        data_cv_dir: str,
-        seed_value: int,
-    ) -> None:
-        self.data_cv_dir = data_cv_dir
-        self.seed_value = seed_value
-
+    def __init__(self, seed_value: int) -> None:
         self.annealing_step:      int             = DEFAULT_ANNEALING_STEP
         self.base_model:          Optional[Union[str, Tuple[str, ...]]] = None
         self.batch_size:          int             = DEFAULT_BATCH_SIZE
         self.building_ensemble:   bool            = False
         self.building_model:      bool            = False
         self.classifier_dropout:  float           = .5
-        self.class_names:         Tuple[str, ...] = ()
         self.cont_opt:            bool            = False
         self.cont_sch:            bool            = False
         self.cpload:              bool            = False
         self.criterion:           str             = ''
+        self.data_classes:        tuple[str, ...] = ()
+        self.data_cv_dir:         str             = ''
         self.epochs:              int             = DEFAULT_EPOCHS
         self.initial_epoch:       Any             = None
         self.inner_dropout:       Union[float, Tuple[float, ...]] = 0.
@@ -1027,6 +1034,7 @@ class Config:
         self.jpeg_quality:        Tuple[int, int] = (90, 98)
         self.load_sublayer_ratio: Optional[Union[float, Tuple[float, float], Sequence[Tuple[float, float]]]] = None
         self.lr_warmup:           bool            = False
+        self.model_classes:       tuple[str, ...] = ()
         self.model_features:      Optional[Union[Dict[str, Any], Tuple[Dict[str, Any], ...]]] = None
         self.need_train_data:     bool            = False
         self.noise_factor_1:      float           = 1 / 56
@@ -1036,6 +1044,7 @@ class Config:
         self.optimizer_type:      Type[Optimizer] = UNTYPED_NONE
         self.resample:            ResampleArgs    = ResampleArgs.parse('+50')
         self.pepper_factor:       float           = 0.
+        self.seed_value = seed_value
         self.scheduler_kwargs:    Optional[Dict[str, Any]] = None
         self.scheduler_name:      str             = ''
         self.scheduler_type:      Optional[Type[_LRScheduler]] = None
@@ -1063,7 +1072,8 @@ def get_save_state_dict(
     save_dict = {
         'task': options.task,
         'base_model': cfg.base_model,
-        'out_classes': cfg.class_names,
+        'data_classes': cfg.data_classes,
+        'out_classes': cfg.model_classes,
         'model_features': cfg.model_features,
         'batch_size': cfg.batch_size,
         'virtual_batch_size': cfg.virtual_batch_size,
@@ -1154,6 +1164,23 @@ def add_weight_decay(model: Module, weight_decay: float, skip_list: Container[st
     ]
 
 
+def get_valid_mcc(net: NeuralNetClassifier, X: Tensor, y_true: Array) -> float:
+    with torch.no_grad():
+        predictions = pos_proba(net.forward(X)).cpu().numpy()
+
+    best_f_scores = best_f_score(y_true, predictions, log=False)
+    # Softened thresholds to improve generalization
+    thresholds = [(th + .5) / 2. for th, fs in best_f_scores]
+
+    # [(label1_true..., label1_pred...), (label2_true..., label2_pred...), ...]
+    pred_data = list(zip_strict(y_true.T, predictions.T))
+
+    return np.mean([
+        matthews_corrcoef(truth, [p > th for p in pred])
+        for (truth, pred), th in zip_strict(pred_data, thresholds)
+    ])
+
+
 def check_cond(typ: Callable[[str], T], cond: Callable[[T], bool], name: str) -> Callable[[str], T]:
     def parse(value: str) -> Any:
         tv = typ(value)
@@ -1182,8 +1209,8 @@ class MainArgParser(Tap):
                   'get_correct', 'roc']
     """What to do with the neural network"""
 
-    data_dir: str  # Dataset location
-    cv_fold: int  # Fold of cross validator to use
+    data_dir: Optional[str] = None  # Dataset location
+    cv_fold: Optional[int] = None  # Fold of cross validator to use
     load: Optional[Tuple[str, ...]] = None  # type: ignore[assignment]
     save: Optional[str] = None  # type: ignore[assignment]
     resample: Optional[str] = None  # Pre-split resample arguments
@@ -1282,17 +1309,17 @@ class MainArgParser(Tap):
 
 
 def main() -> None:
-    global cfg, dataloaders, data_transforms, device, model, options
+    global cfg, device, options, transformed_datasets
+
+    # Filter a SkorchWarning about on_batch_{begin,end} signature
+    warnings.filterwarnings('ignore', category=SkorchWarning)
 
     disable_echo()
 
     parser = MainArgParser(underscores_to_dashes=True)
     options = parser.parse_args()
 
-    cfg = Config(
-        data_cv_dir=os.path.join(options.data_dir, 'fold{}'.format(options.cv_fold)),
-        seed_value=options.seed,
-    )
+    cfg = Config(seed_value=options.seed)
     seed_all(cfg.seed_value)
 
     # The number of requested models. Note: This may be one model which has submodels.
@@ -1472,6 +1499,27 @@ def main() -> None:
             cfg.criterion = options.criterion
             cfg.annealing_step = DEFAULT_ANNEALING_STEP if options.annealing_step is None else options.annealing_step
 
+    if options.data_dir is not None and options.cv_fold is not None:
+        opts_cv_dir = os.path.join(options.data_dir, 'fold{}'.format(options.cv_fold))
+    elif options.data_dir is not None or options.cv_fold is not None:
+        parser.error('--data-dir and --cv-fold must be specified together')
+    else:
+        opts_cv_dir = None
+
+    if checkpoint is None:
+        if opts_cv_dir is None:
+            parser.error('--data-dir and --cv-fold must be specified unless loading a checkpoint')
+        assert opts_cv_dir is not None
+        cfg.data_cv_dir = opts_cv_dir
+    else:
+        cfg.data_cv_dir = checkpoint['opt_eval_dataset']
+        if opts_cv_dir is not None:
+            if opts_cv_dir == cfg.data_cv_dir:
+                print('\x1b[93;1mWarning: --data-dir and --cv-fold unnecessarily specified\x1b[0m', file=sys.stderr)
+            else:
+                print('==> Overriding dataset: {!r} -> {!r}'.format(cfg.data_cv_dir, opts_cv_dir))
+                cfg.data_cv_dir = opts_cv_dir
+
     if checkpoint is not None:
         cfg.batch_size = checkpoint['batch_size']
         cfg.virtual_batch_size = checkpoint.get('virtual_batch_size')
@@ -1502,14 +1550,10 @@ def main() -> None:
         if len(cfg.inner_dropout) == 1:
             cfg.inner_dropout, = cfg.inner_dropout
     else:
-        cfg.inner_dropout = 0 if req_models == 1 else tuple(0 for _ in range(req_models))
+        cfg.inner_dropout = 0. if req_models == 1 else tuple(0. for _ in range(req_models))
 
     if cfg.cpload:
-        try:
-            cfg.classifier_dropout = checkpoint['classifier_dropout']
-        except KeyError:
-            print('\x1b[93;1mWarning: Unknown classifier_dropout, defaulting to 0.5\x1b[0m', file=sys.stderr)
-            cfg.classifier_dropout = .5
+        cfg.classifier_dropout = checkpoint['classifier_dropout']
 
         if options.classifier_dropout is not None:
             if math.isclose(options.classifier_dropout, cfg.classifier_dropout):
@@ -1520,7 +1564,7 @@ def main() -> None:
                 ))
                 cfg.classifier_dropout = options.classifier_dropout
     else:
-        cfg.classifier_dropout = 0 if options.classifier_dropout is None else options.classifier_dropout
+        cfg.classifier_dropout = 0. if options.classifier_dropout is None else options.classifier_dropout
 
     if not cfg.need_train_data:
         for opt in ('resample', 'noise-factors', 'jpeg-quality', 'jpeg-iterations', 'pepper-factor'):
@@ -1595,8 +1639,7 @@ def main() -> None:
     else:
         cfg.tta_mode = 'none' if options.tta is None else options.tta
 
-    print("==> Dataset: {!r}".format(options.data_dir))
-    print("==> CV fold: {}".format(options.cv_fold))
+    print("==> Dataset: {!r}".format(cfg.data_cv_dir))
 
     data_transforms = {}
     if checkpoint is not None:
@@ -1615,41 +1658,26 @@ def main() -> None:
             )
         data_transforms['test'] = transforms.Compose([MayResize(), transforms.ToTensor()])
 
-    cnames: Optional[Tuple[str, ...]] = None
-    if cfg.cpload:
-        try:
-            cnames = checkpoint['out_classes']
-        except KeyError:
-            pass
-        else:
-            assert cnames
-    if cnames is None or options.task in ('eval_test', 'get_correct'):
-        with open(os.path.join(options.data_dir, 'classes.txt')) as f:
-            data_cnames = tuple(next(iter(f)).rstrip('\r\n').split(','))
-        assert data_cnames
-    if cnames is None:
-        cnames = data_cnames
-        if options.class_filter is not None:
-            assert not cfg.cpload
-            assert options.class_filter
-            assert set(options.class_filter).issubset(set(cnames))
-            cnames = options.class_filter
+    with open(os.path.join(cfg.data_cv_dir, '..', 'classes.txt')) as f:
+        cfg.data_classes = tuple(next(iter(f)).rstrip('\r\n').split(','))
 
-        if cfg.cpload:
-            try:
-                cp_numclass = len(checkpoint['out_classes'])
-            except KeyError:
-                cp_numclass = checkpoint['out_features']
-            assert cnames is not None and cp_numclass == len(cnames)
-    assert cnames is not None
-    cfg.class_names = cnames
+    if cfg.cpload:
+        assert options.class_filter is None
+        cfg.model_classes = checkpoint['out_classes']
+        assert checkpoint['data_classes'] == cfg.data_classes
+    elif options.class_filter is not None:
+        cfg.model_classes = options.class_filter
+    else:
+        cfg.model_classes = cfg.data_classes
+    assert set(cfg.model_classes).issubset(set(cfg.data_classes))
 
     image_datasets: Dict[str, LabeledDataset] = {
         x: MultiLabelCSVDataset(
-            cfg.class_names,
+            cfg.model_classes,
             os.path.join(cfg.data_cv_dir, '{}_tagged.csv'.format(x)),
-            os.path.join(options.data_dir, 'images'),
+            os.path.join(cfg.data_cv_dir, '..', 'images'),
         ) for x in ('train', 'opt', 'test')}
+    image_datasets['valid'] = CatDataset(image_datasets['opt'], image_datasets['test'])
 
     if options.quick_find:
         image_datasets['train'] = LabeledSubset(image_datasets['train'], range(250))
@@ -1658,15 +1686,7 @@ def main() -> None:
     if options.task == 'preview_input':
         cfg.num_workers = 0  # Just need a little data, grab in the main thread
 
-    def make_dataloader(dataset: LabeledDataset, transform: Callable[[Image.Image], Tensor]) -> DataLoader:
-        return DataLoader(
-            TransformedDataset(dataset, transform),
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
-            pin_memory=True,
-        )
-
-    dataloaders = {}
+    transformed_datasets = {}
     bal_train_dataset: LabeledDataset = UNTYPED_NONE
     if options.task != 'print_numels':
         if cfg.need_train_data:
@@ -1679,8 +1699,11 @@ def main() -> None:
             # prevent single-item batch at end of training phase - breaks batchnorm
             if len(bal_train_dataset) % cfg.batch_size == 1:
                 bal_train_dataset = LabeledSubset(bal_train_dataset, np.arange(get_len(bal_train_dataset) - 1))
-        dataloaders['opt'] = make_dataloader(image_datasets['opt'], data_transforms['test'])
-        dataloaders['test'] = make_dataloader(image_datasets['test'], data_transforms['test'])
+            bal_train_dataset_tform = TransformedDataset(bal_train_dataset, data_transforms['train'])
+        for name in ('opt', 'test', 'valid'):
+            transformed_datasets[name] = TransformedDataset(image_datasets[name], data_transforms['test'])
+
+    del image_datasets
 
     def set_input_size(size: Tuple[int, int]) -> None:
         ops = (next(o for o in dt.transforms if type(o).__name__ == 'MayResize') for dt in data_transforms.values())
@@ -1691,21 +1714,21 @@ def main() -> None:
         set_input_size((224, 224))
 
         # Get a batch of training data
-        dataloaders['train'] = make_dataloader(bal_train_dataset, data_transforms['train'])
-        inputs, classes = next(iter(dataloaders['train']))
+        train_iter = make_dataloader(bal_train_dataset_tform)
+        inputs, classes = next(iter(train_iter))
 
         # Make a grid from batch
         out = torchvision.utils.make_grid(inputs)
 
         imshow(out, title=str([
-            ','.join(cn for c, cn in zip_strict(cl, cfg.class_names) if c > .99)
+            ','.join(cn for c, cn in zip_strict(cl, cfg.model_classes) if c > .99)
             for cl in classes]))
 
         sys.exit(0)
 
     model_loader = ModelLoader(
         base_model=cfg.base_model if checkpoint is None else None,
-        num_labels=len(cfg.class_names),
+        num_labels=len(cfg.model_classes),
         features=cfg.model_features,
         checkpoint=checkpoint,
         sub_cps=sub_cps,
@@ -1733,7 +1756,7 @@ def main() -> None:
 
     if checkpoint is not None:
         assert options.load is not None and len(options.load) == 1
-        print("==> Loaded checkpoint from '{}'.".format(*options.load))
+        print('==> Loaded checkpoint from {!r}.'.format(*options.load))
         print('  Epoch: {}'.format(checkpoint.get('epoch', 'N/A')))
         print('  Test loss: {:.4f}'.format(checkpoint.get('test_loss', None) or checkpoint['val_loss']))
 
@@ -1797,8 +1820,11 @@ def main() -> None:
         model_loader.postload()
         del model_loader
         optimizer = cfg.optimizer_type(opt_params, lr=options.lr)
-        best_params = find_best_augment_params(bal_train_dataset, dataloaders, optimizer, model, device,
-                                               nontrain_criterion, make_dataloader)
+        best_params = find_best_augment_params(
+            bal_train_dataset, transformed_datasets['opt'],
+            optimizer, model, device, nontrain_criterion,
+            make_dataloader,
+        )
         print('Best augmentation parameters:\n{}'.format(best_params))
         sys.exit(0)
 
@@ -1847,8 +1873,8 @@ def main() -> None:
         else:
             cfg.scheduler_name = DEFAULT_SCHEDULER if options.scheduler is None else options.scheduler
             sch_period = options.sch_period or DEFAULT_SCH_PERIOD
-            assert options.gamma is not None
             if cfg.scheduler_name == 'cyclic':
+                assert options.gamma is not None
                 cfg.scheduler_type = CyclicLRWithRestarts
                 cfg.scheduler_kwargs = {'batch_size': cfg.batch_size, 'epoch_size': get_len(bal_train_dataset),
                                         'restart_period': 1, 't_mult': 1,
@@ -1860,6 +1886,7 @@ def main() -> None:
                 cfg.scheduler_type = CosineAnnealingLR
                 cfg.scheduler_kwargs = {'T_max': cfg.epochs}
             elif cfg.scheduler_name == 'linear':
+                assert options.gamma is not None
                 cfg.scheduler_type = StepLR
                 cfg.scheduler_kwargs = {'step_size': sch_period, 'gamma': options.gamma}
             elif cfg.scheduler_name == 'NONE':
@@ -1905,7 +1932,6 @@ def main() -> None:
             for group in optimizer.param_groups:
                 group['initial_lr'] = group['lr'] = options.lr
 
-        assert scheduler is not None
         pbar = ProgressBar()
         trainer_cb = TrainerCallback(scheduler, warmup_scheduler, pbar)
 
@@ -1925,8 +1951,16 @@ def main() -> None:
             iterator_train__pin_memory=True,
             iterator_valid__num_workers=cfg.num_workers,
             iterator_valid__pin_memory=True,
-            callbacks=[trainer_cb, pbar],
-            callbacks__valid_acc=None,
+            callbacks=[
+                EpochScoring(
+                    get_valid_mcc,
+                    name='valid_mcc',
+                    lower_is_better=False,
+                ),
+                trainer_cb,
+                pbar,
+            ],
+            callbacks__print_log=MyPrintLog(),
             warm_start=True,
             device=device,
             **({} if checkpoint is None else {
@@ -1934,8 +1968,7 @@ def main() -> None:
                 'virtual_params_': checkpoint['virtual_params'],
             }),
         )
-        if cfg.epochs == 0:
-            net.initialize()
+        net.initialize()
 
         if checkpoint is not None:
             state: Dict[str, Any] = checkpoint['random_state']
@@ -1947,12 +1980,14 @@ def main() -> None:
 
         del checkpoint  # Not used past this point
 
-        ds_train = TransformedDataset(bal_train_dataset, data_transforms['train'])
-        ds_valid = TransformedDataset(image_datasets['test'], data_transforms['test'])
+        # Record initial state
+        ds_valid = net.get_dataset(transformed_datasets['test'])
+        net.notify('on_epoch_begin', dataset_train=None, dataset_valid=ds_valid)
+        net.run_single_epoch(ds_valid, training=False, prefix='valid', step_fn=net.validation_step, epoch=0)
+        net.notify('on_epoch_end', dataset_train=None, dataset_valid=ds_valid)
 
         # Train the model
-        net.fit(ds_train, y=ds_valid)
-        del ds_train, ds_valid
+        net.fit(bal_train_dataset_tform, y=None, valid=transformed_datasets['valid'])
 
         model_state_dict = copy.deepcopy(model.state_dict())
         optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
@@ -1967,40 +2002,16 @@ def main() -> None:
             best_state_dict = torch.load(trainer_cb.best_state)
             model.load_state_dict(best_state_dict['model_state_dict'])
 
-        print('==> Evaluating on test data...')
-        total_test_loss = 0
-        opt_eval_y_pred = []
-        opt_eval_y_u = []
-        opt_eval_tot_ev = []
-        opt_eval_y_true = image_datasets['opt'].targets
-
-        with torch.no_grad():
-            for data in tqdm(dataloaders['opt'], leave=False):
-                Xi, yi = unpack_data(data)
-                alpha  = net.evaluation_step(Xi)
-                X_meta = pos_proba(alpha).cpu().numpy()
-                y_u    = pred_uncertainty(alpha).cpu().numpy()
-                tot_ev = torch.sum(alpha - 1, dim=-1).cpu().numpy()
-                opt_eval_y_pred.append(X_meta)
-                opt_eval_y_u.append(y_u)
-                opt_eval_tot_ev.append(tot_ev)
-                y_pred, y_true = alpha, torch.as_tensor(yi, device=net.device)
-                loss = net.criterion_(y_pred, y_true, cfg.initial_epoch + cfg.epochs)
-                total_test_loss += loss.item()
-            test_loss = total_test_loss / len(opt_eval_y_pred)
-            opt_eval_y_pred_n = np.concatenate(opt_eval_y_pred)
-            opt_eval_y_u_n = np.concatenate(opt_eval_y_u)
-            opt_eval_tot_ev_n = np.concatenate(opt_eval_tot_ev)
+        print("==> Evaluating on 'opt' data...")
+        opt_eval_y_pred, opt_eval_y_u, opt_eval_tot_ev, opt_eval_y_true, test_loss = \
+            eval_inner(net, transformed_datasets['opt'], cfg.initial_epoch + cfg.epochs, progress=True, leave=False)
 
         if scheduler is not None:
             scheduler.optimizer = None
 
         if options.save is not None:
             if savedir := os.path.dirname(options.save):
-                try:
-                    os.mkdir(savedir)
-                except FileExistsError:
-                    pass
+                os.makedirs(savedir, exist_ok=True)
             if best_state_dict is not None:
                 save_dict = best_state_dict
                 assert save_dict is not None  # Assume training began
@@ -2020,13 +2031,13 @@ def main() -> None:
                 model=model,
                 data_transforms=data_transforms,
                 opt_eval_y_true=opt_eval_y_true,
-                opt_eval_y_pred=opt_eval_y_pred_n,
-                opt_eval_y_u=opt_eval_y_u_n,
-                opt_eval_tot_ev=opt_eval_tot_ev_n,
+                opt_eval_y_pred=opt_eval_y_pred,
+                opt_eval_y_u=opt_eval_y_u,
+                opt_eval_tot_ev=opt_eval_tot_ev,
                 test_loss=test_loss,
             ))
             torch.save(save_dict, options.save, pickle_module=mypickle)
-            print("==> Saved checkpoint to '{}'.".format(options.save))
+            print('==> Saved checkpoint to {!r}.'.format(options.save))
         sys.exit(0)
 
     # visualize, metrics, or roc
@@ -2038,11 +2049,28 @@ def main() -> None:
     del checkpoint
 
     model.eval()
+    net = MyNeuralNetClassifier(
+        lambda model: model,
+        module__model=model,
+        criterion=criterion_type,
+        criterion__norm_params=norm_params,
+        criterion__model=model,
+        criterion__annealing_step=cfg.annealing_step,
+        optimizer=None,
+        initial_epoch=cfg.initial_epoch,
+        batch_size=cfg.batch_size,
+        iterator_train=None,
+        iterator_valid__num_workers=cfg.num_workers,
+        iterator_valid__pin_memory=True,
+        callbacks='disable',
+        device=device,
+    )
+    net.initialize()
 
     if options.task == 'visualize':
-        print_predictions(model, nontrain_criterion, eval_checkpoint)
+        print_predictions(model, eval_checkpoint)
     elif options.task == 'metrics':
-        Metrics().metrics_eval(model, nontrain_criterion, eval_checkpoint)
+        Metrics().metrics_eval(model, eval_checkpoint)
     elif options.task == 'eval_test':
         assert options.eval_dir is not None
         try:
@@ -2050,7 +2078,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        Metrics().test_eval(model, nontrain_criterion, eval_checkpoint)
+        Metrics().test_eval(net, eval_checkpoint)
     elif options.task == 'get_correct':
         assert options.correct_dir is not None
         try:
@@ -2058,7 +2086,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        Metrics().correct_eval(model, nontrain_criterion, eval_checkpoint, data_cnames)
+        Metrics().correct_eval(net, eval_checkpoint)
     elif options.task == 'roc':
         assert options.fig_dir is not None
         try:
@@ -2066,7 +2094,7 @@ def main() -> None:
         except FileExistsError:
             pass
 
-        roc_eval(model, nontrain_criterion, options.fig_dir, eval_checkpoint)
+        roc_eval(net, options.fig_dir, eval_checkpoint)
     else:
         raise AssertionError('Invalid task!')
 
