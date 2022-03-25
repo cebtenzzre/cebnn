@@ -9,14 +9,14 @@ pretrainedmodels==0.7.4
 pytorch-warmup==0.0.4
 scikit-learn>=1.0.2
 scipy>=1.8.0
-skorch==0.9.0
+skorch==0.11.0
 timm==0.5.4
 torch==1.11.0
 torchvision>=0.12.0,<0.13
 tqdm>=4.63.0
 adabelief-pytorch @ https://github.com/juntang-zhuang/Adabelief-Optimizer/archive/update_0.3.0.zip#subdirectory=pypi_packages/adabelief_pytorch0.3.0
-https://github.com/cebtenzzre/apex/archive/master.zip
+https://github.com/cebtenzzre/apex/archive/master.zip --global-option="--cpp_ext" --global-option="--cuda_ext"
 git+https://github.com/numba/llvmlite.git#egg=llvmlite
 git+https://github.com/numba/numba.git#egg=numba
 https://github.com/cebtenzzre/scikit-multilearn/archive/master.zip
-https://github.com/cebtenzzre/typed-argument-parser/archive/master.zip
+https://github.com/cebtenzzre/typed-argument-parser/archive/adapted.zip
