@@ -6,6 +6,7 @@ import abc
 import dataclasses
 import sys
 from dataclasses import dataclass
+from functools import reduce
 from itertools import count, islice, zip_longest
 from math import ceil, isclose
 from numbers import Real
@@ -21,7 +22,7 @@ from torch.nn import functional as F
 from util import zip_strict, zipstar_strict
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, Dict, List, Literal, Optional
+    from typing import Any, Dict, List, Literal, Optional
     from torch import Tensor
 
 
@@ -178,24 +179,8 @@ def parse_sublayer_ratio(sublayer_ratio: Union[float, Tuple[float, float], Seque
     return endify(sublayer_ratio)
 
 
-def apply_tta(eval_fun: Callable[[Tensor], Tensor], x: Tensor, mode: str, training: bool) -> Tensor:
-    alpha1 = eval_fun(x)
-    if training or mode == 'none':
-        return alpha1
-
-    alpha2 = eval_fun(x.flip(dims=(-1,)))
-    if mode == 'mean':  # Simple mean of model outputs
-        return torch.mean(torch.stack((alpha1, alpha2)), dim=0)
-    if mode == 'local_certainty':  # Pick most certain model per label
-        return torch.max(alpha1, alpha2)
-    if mode == 'global_certainty':  # Pick most certain model per sample
-        def select(ab: Tensor, i: Tensor) -> Tensor:
-            return ab.gather(0, i.unsqueeze(dim=0)).squeeze(dim=0)
-        alphas = torch.stack((alpha1, alpha2))
-        sample_ev = alphas.sum(dim=-1, keepdim=True)
-        return select(alphas, sample_ev.argmax(dim=0).expand(alpha1.shape))
-
-    raise AssertionError('Invalid TTA mode!')
+def tta_select(ab: Tensor, i: Tensor) -> Tensor:
+    return ab.gather(0, i.unsqueeze(dim=0)).squeeze(dim=0)
 
 
 # Subclasses must use dirichlet() in forward()
@@ -214,6 +199,23 @@ class BaseDirichletModel(nn.Module, metaclass=abc.ABCMeta):
             std_  = torch.as_tensor(std,  dtype=batch.dtype, device=batch.device)[None, :, None, None]
             return batch.sub(mean_).div_(std_)
 
+    def apply_tta(self, x: Tensor, mode: str, training: bool) -> Tensor:
+        alpha1 = self.forward_(x)
+        if training or mode == 'none':
+            return alpha1
+
+        alpha2 = self.forward_(x.flip(dims=(-1,)))
+        if mode == 'mean':  # Simple mean of model outputs
+            return torch.mean(torch.stack((alpha1, alpha2)), dim=0)
+        if mode == 'local_certainty':  # Pick most certain model per label
+            return torch.max(alpha1, alpha2)
+        if mode == 'global_certainty':  # Pick most certain model per sample
+            alphas = torch.stack((alpha1, alpha2))
+            sample_ev = alphas.sum(dim=-1, keepdim=True)
+            return tta_select(alphas, sample_ev.argmax(dim=0).expand(alpha1.shape))
+
+        raise AssertionError('Invalid TTA mode!')
+
 
 class DirichletModel(BaseDirichletModel):
     def __init__(self, model: Any, tta_mode: str) -> None:
@@ -221,27 +223,33 @@ class DirichletModel(BaseDirichletModel):
         self.model = model
         self.tta_mode = tta_mode
         self._fc_info = FCInfo(model)
+        self.max_insize = self.default_cfg['input_size'][-2:]
+        self._cfg_mean = self.default_cfg['mean']
+        self._cfg_std = self.default_cfg['std']
 
-    @property
+    @property  # type: ignore[misc]
+    @torch.jit.unused  # type: ignore[misc]
     def default_cfg(self) -> Dict[str, Any]:
         return self.model.default_cfg
 
-    @property
+    @property  # type: ignore[misc]
+    @torch.jit.unused  # type: ignore[misc]
     def fc(self) -> Module:
         return self._fc_info.get()
 
-    @fc.setter
+    @fc.setter  # type: ignore[misc]
+    @torch.jit.unused
     def fc(self, fc: Module) -> None:
         self._fc_info.set(fc)
 
     def forward_(self, x: Tensor) -> Tensor:
-        x = self.normalize_batch(x, self.model.default_cfg['mean'], self.model.default_cfg['std'])
+        x = self.normalize_batch(x, self._cfg_mean, self._cfg_std)
         x = self.model(x)
         x = self.dirichlet(x)
         return x
 
     def forward(self, x: Tensor) -> Tensor:
-        return apply_tta(self.forward_, x, mode=self.tta_mode, training=self.training)
+        return self.apply_tta(x, mode=self.tta_mode, training=self.training)
 
 
 class CatModel(BaseDirichletModel):
@@ -256,7 +264,9 @@ class CatModel(BaseDirichletModel):
             models = ((m.model if isinstance(m, DirichletModel) else m) for m in models)
 
         self.models = nn.ModuleList(models)
-        self.input_sizes = []
+        self._input_sizes = []
+        self._means = []
+        self._stds = []
         self.fc_infeatures = []
         for model in self.models:
             fc_info = FCInfo(model)
@@ -264,7 +274,9 @@ class CatModel(BaseDirichletModel):
 
             inx, iny = model.default_cfg['input_size'][-2:]
             assert inx == iny
-            self.input_sizes.append(inx)
+            self._input_sizes.append(inx)
+            self._means.append(model.default_cfg['mean'])
+            self._stds.append(model.default_cfg['std'])
 
             if out_features is not None:
                 if hasattr(fc, 'in_features'):
@@ -276,8 +288,11 @@ class CatModel(BaseDirichletModel):
 
                 fc_info.set(nn.Identity())
 
-        self.insize_uniq = sorted(set(self.input_sizes), reverse=True)
-        print('==> CatModel input sizes: {}'.format(self.insize_uniq))
+        self._insize_uniq = sorted(set(self._input_sizes), reverse=True)
+        print('==> CatModel input sizes: {}'.format(self._insize_uniq))
+
+        insizes = (m.default_cfg['input_size'][-2:] for m in self.models)
+        self.max_insize = reduce(lambda s1, s2: (max(s1[0], s2[0]), max(s1[1], s2[1])), insizes)
 
         # NB: Placeholder, will be replaced and have dropout added later
         self.fc = nn.Identity() if out_features is None else nn.Linear(sum(self.fc_infeatures), out_features)
@@ -285,11 +300,11 @@ class CatModel(BaseDirichletModel):
     def forward_(self, x: Tensor) -> Tensor:
         # One scale at a time
         outputs: List[torch.Tensor] = []
-        for insize in self.insize_uniq:
+        for insize in self._insize_uniq:
             scaled = self.scale_batch(x, insize)
-            for model, m_insize in zip_strict(self.models, self.input_sizes):
+            for model, m_insize, mean, std in zip_strict(self.models, self._input_sizes, self._means, self._stds):
                 if m_insize == insize:
-                    norm = self.normalize_batch(scaled, model.default_cfg['mean'], model.default_cfg['std'])
+                    norm = self.normalize_batch(scaled, mean, std)
                     outputs.append(model(norm))
             del scaled
 
@@ -301,7 +316,7 @@ class CatModel(BaseDirichletModel):
         return x
 
     def forward(self, x: Tensor) -> Tensor:
-        return apply_tta(self.forward_, x, mode=self.tta_mode, training=self.training)
+        return self.apply_tta(x, mode=self.tta_mode, training=self.training)
 
     @staticmethod
     def scale_batch(batch: Tensor, insize: int) -> Tensor:
@@ -338,6 +353,45 @@ class GhostBatchNorm(nn.BatchNorm2d):
     def forward(self, x: Tensor) -> Tensor:
         chunks = x.chunk(ceil(x.size(0) / self.virtual_batch_size))
         return torch.cat(list(map(super().forward, chunks)))
+
+
+# inplace fused ReLU+Dropout for better memory usage
+class ReLUDropout(nn.Dropout):
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0:
+            return F.relu(x, inplace=self.inplace)
+
+        if not self.inplace:
+            x = x.copy()
+        mask = torch.rand_like(x) < self.p
+        mask |= (x < 0.)
+        x = x.masked_fill_(mask, 0.) if self.inplace else x.masked_fill(mask, 0.)
+        return x
+
+
+# inplace fused ReLU6+Dropout for better memory usage
+class ReLU6Dropout(nn.Dropout):
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0:
+            return F.hardtanh(x, 0., 6., self.inplace)
+
+        mask = (x > 6.)
+        x = x.masked_fill_(mask, 6.) if self.inplace else x.masked_fill(mask, 6.)
+        mask = torch.rand_like(x) < self.p
+        mask |= (x < 0.)
+        x = x.masked_fill_(mask, 0.)
+        return x
+
+
+# combined SiLU+Dropout for better memory usage
+class SiLUDropout(nn.Dropout):
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0:
+            return F.silu(x, inplace=self.inplace)
+
+        x = F.dropout(x, self.p, self.training, inplace=self.inplace)
+        x = F.silu(x, inplace=True)
+        return x
 
 
 @dataclass(init=False)
@@ -475,11 +529,7 @@ class ModelLoader:
             assert len(self.inner_dropout) == len(self.base_model)
         if classifier_dropout is None and num_labels is not False:
             assert checkpoint is not None
-            try:
-                classifier_dropout = checkpoint['classifier_dropout']
-            except KeyError:
-                print('\x1b[93;1mWarning: Unknown classifier_dropout, defaulting to 0.5\x1b[0m', file=sys.stderr)
-                classifier_dropout = .5
+            classifier_dropout = checkpoint['classifier_dropout']
         self.classifier_dropout = classifier_dropout
         self.freeze_fc = freeze_fc
         self.merge_fc = merge_fc and isinstance(self.base_model, tuple)
@@ -562,9 +612,14 @@ class ModelLoader:
             self.model = model
             del model
 
-        def apply_post_dropout(*modules: Module) -> nn.Sequential:
+        def apply_post_dropout(module: Module) -> nn.Sequential:
             assert not isinstance(self.inner_dropout, tuple)
-            return nn.Sequential(*modules, nn.Dropout(self.inner_dropout))
+            if type(module) is nn.Identity:
+                return module
+            types = {nn.ReLU: ReLUDropout, nn.ReLU6: ReLU6Dropout, nn.SiLU: SiLUDropout}
+            if t := types.get(type(module)):
+                return t(self.inner_dropout, inplace=True)
+            return nn.Dropout(self.inner_dropout, inplace=True)
 
         def make_gbn(bn: nn.BatchNorm2d, virtual_batch_size: int) -> GhostBatchNorm:
             gbn = GhostBatchNorm(bn.num_features, bn.eps, bn.momentum, bn.affine, bn.track_running_stats,
@@ -749,7 +804,7 @@ class ModelLoader:
                 classifier = nn.Conv2d(fc.in_channels, self.out_features, kernel_size=1, stride=1)
             else:
                 raise RuntimeError('Could not find in_features/in_channels')
-            fc = nn.Sequential(nn.Dropout(self.classifier_dropout), classifier)
+            fc = nn.Sequential(nn.Dropout(self.classifier_dropout, inplace=True), classifier)
             del classifier
 
             fc_info.set(fc)
@@ -785,7 +840,7 @@ class ModelLoader:
             print('==> Loaded model state from checkpoint.')
 
         self.checkpoint = True  # type: ignore  # Save memory
-        return self.model
+        return torch.jit.script(self.model)
 
     def postload(self) -> None:
         if self.subloaders is None:

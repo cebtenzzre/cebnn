@@ -1729,14 +1729,7 @@ def main() -> None:
     cfg.sublayer_ratio = model_loader.sublayer_ratio
 
     # Resize samples in dataloader worker threads
-    if isinstance(model, CatModel):
-        models: Union[nn.ModuleList, Sequence[Any]] = model.models
-    else:
-        models = (model,)
-    insizes = (m.default_cfg['input_size'][-2:] for m in models)
-    max_insize = reduce(lambda s1, s2: (max(s1[0], s2[0]), max(s1[1], s2[1])), insizes)
-    set_input_size(max_insize)
-    del models, insizes, max_insize
+    set_input_size(model.max_insize)
 
     if checkpoint is not None:
         assert options.load is not None and len(options.load) == 1
