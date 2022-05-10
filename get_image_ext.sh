@@ -31,7 +31,7 @@ esac
 
 if [[ $newext == 'jpg' ]]; then
   # Detect broken/unreadable multi-image JPEGs
-  python - "$1" || exit 0 <<'EOF'
+  python - "$1" <<'EOF' || exit 0
 import sys; from PIL import Image
 with Image.open(sys.argv[1]) as img:
   if getattr(img, 'is_animated', False):
