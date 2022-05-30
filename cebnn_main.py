@@ -457,12 +457,18 @@ def plot_roc(true_labels: Array, predictions: Array, fig_dir: StrPath) -> None:
     plt.savefig(os.path.join(fig_dir, '{}_roc.svg'.format(bname)), bbox_inches='tight')
 
 
+def worker_init_fn(worker_id: int) -> None:
+    torch_seed = torch.initial_seed()
+    random.seed(torch_seed + worker_id)
+    np.random.seed((torch_seed + worker_id) % 2**32)
+
 def make_dataloader(dataset: LabeledDataset) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
 
 
