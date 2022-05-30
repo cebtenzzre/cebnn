@@ -61,6 +61,7 @@ if __name__ == '__main__':
         uncertainties_list.append(list2npu(pkl_uncertainties, numlabels)[:, lblidx])
 
     assert y_true_l is not None
+    assert numlabels is not None
     y_true = list2np(y_true_l, numlabels)[:, lblidx]
     del y_true_l
 

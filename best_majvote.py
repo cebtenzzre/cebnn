@@ -46,6 +46,7 @@ BATCH_SIZE = 64
 
 
 class EvalPickle(TypedDict):
+    label_count: int
     y_true: List[Optional[bool]]
     y_pred: List[Optional[bool]]
     y_u: List[Optional[float]]
@@ -230,6 +231,7 @@ class AllOddCombinations:
                     yield (*combo[:i + 1], *(e for _ in range(dup)), *combo[i + 1:])
 
     def _get_combos(self) -> Iterator[Tuple[int, ...]]:
+        it: Iterator[Tuple[int, ...]]
         it = itertools.chain.from_iterable(
             itertools.combinations(self._seq, i)
             for i in range(self._min_len, self._max_len + 1)

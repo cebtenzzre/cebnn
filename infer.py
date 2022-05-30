@@ -19,7 +19,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from augment import MayResize
-from cebnn_common import CatModel, ModelLoader, pos_proba, pred_uncertainty
+from cebnn_common import ModelLoader, pos_proba, pred_uncertainty
 from scale import load_and_scale
 from util import zip_strict
 

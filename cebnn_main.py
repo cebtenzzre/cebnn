@@ -718,7 +718,7 @@ class TrainerCallback(Callback):
         self.start_time: Optional[float] = None
 
     def on_epoch_begin(self, net: NeuralNetClassifier, dataset_train: Optional[AnyDataset] = None,  # noqa: U100
-                       dataset_valid: Optional[AnyDataset] = None, **kwargs: Any) -> None:
+                       dataset_valid: Optional[AnyDataset] = None, **kwargs: object) -> None:  # noqa: U100
         net.history[-1]['epoch'] -= 1  # offset for pre-epoch
 
         self.pbar.batches_per_epoch = (
@@ -733,6 +733,7 @@ class TrainerCallback(Callback):
     def on_batch_begin(self, net: NeuralNetClassifier, batch: object = None,  # noqa: U100
                        training: Optional[bool] = None, **kwargs: object) -> None:  # noqa: U100
         if training and self.warmup_scheduler is not None:
+            assert self.scheduler is not None
             with warnings.catch_warnings():
                 # Deprecated step() usage is recommended by the warmup scheduler
                 warnings.filterwarnings('ignore', '.*call them in the opposite order.*', UserWarning)

@@ -115,7 +115,7 @@ class DatasetStats:
 
 # http://doi.org/10.1007/978-3-319-10840-7_1
 def mlenn(dataset: Dataset, threshold: float = .75, num_neighbors: int = 3,
-          ds_labels: Optional[Iterable[str]] = None, **kwargs: Any) -> List[int]:
+          ds_labels: Optional[Iterable[str]] = None, **kwargs: object) -> List[int]:  # noqa: U100
     dstats = DatasetStats(dataset, ds_labels)
     del ds_labels
 
@@ -144,7 +144,7 @@ def mlenn(dataset: Dataset, threshold: float = .75, num_neighbors: int = 3,
 
 # http://doi.org/10.1016/j.neucom.2019.11.076
 def mltl(dataset: Dataset, threshold_in: Optional[float] = None,
-         ds_labels: Optional[Iterable[str]] = None, **kwargs: Any) -> List[int]:
+         ds_labels: Optional[Iterable[str]] = None, **kwargs: object) -> List[int]:  # noqa: U100
     dstats = DatasetStats(dataset, ds_labels)
     del ds_labels
 
